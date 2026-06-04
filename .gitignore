@@ -1,0 +1,68 @@
+# Config
+config.toml
+
+# GENERAL
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
+*.db
+*.pem
+*.key
+data/
+bin/
+
+# Build outputs
+dist/
+build/
+.out/
+.next/
+
+# Cache
+.cache/
+.parcel-cache/
+.eslintcache
+.vite/
+# Queue worker logs
+pkg/queue/*.jsonl
+
+# Coverage
+coverage/
+
+# Cargo
+/target/
+**/target/
+
+# Rustfmt & Clippy
+.rustfmt.toml
+cargo.lock
+
+# Rust analyzer
+.rust-analyzer/
+
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+
+.idea/
+*.swp
+*.swo
+
+# TESTING
+jest-cache/
+playwright-report/
+test-results/
+
+# DEVELOPEMENT SSL
+**/localhost-key.pem
+**/localhost.pem
+
+# additional
+.agent/
+.cursor
+.opencode/
+
+# Used for testing
+tmp/
+archive/
