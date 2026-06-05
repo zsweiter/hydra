@@ -29,7 +29,7 @@ func testClient(t testing.TB) *redis.Client {
 
 func newDB(t testing.TB) *Storage {
 	t.Helper()
-	return New(testClient(t))
+	return Use(testClient(t))
 }
 
 // ──────────────────────────────────────────────

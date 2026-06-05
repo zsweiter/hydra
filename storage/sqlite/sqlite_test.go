@@ -13,7 +13,7 @@ import (
 
 func newDB(t testing.TB) *Storage {
 	t.Helper()
-	s, err := NewFromOptions(&Options{Path: "file:test.db?mode=memory"})
+	s, err := New("file:test.db?mode=memory")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -18,7 +18,7 @@ and storage concerns internal.
 - Queue-based workload isolation
 - Idempotency support
 - Dead-letter queue
-- Pluggable storage (in-memory default, SQLite/PostgreSQL/Redis soon)
+- Pluggable storage (in-memory default, SQLite, Redis)
 - Zero CPU consumption when idle
 
 ## Installation
@@ -228,14 +228,15 @@ q.Resume(ctx, "emails") // resumes dispatching
 
 ```go
 type Config struct {
-    MinWorkers    int           // default: 1
-    MaxWorkers    int           // default: 16
-    ScaleDownIdle time.Duration // default: 10s
-    BatchSize     int           // default: 10
-    LeaseTTL      time.Duration // default: 30s
-    MaxRetries    int           // default: 3
-    Logger        logger.Logger
-    Storage       storage.Storage // default: in-memory
+    MinWorkers       int           // default: 1
+    MaxWorkers       int           // default: 16
+    ScaleUpThreshold float64       // channel occupancy (0.0–1.0) to trigger scale-up; default 0.25
+    ScaleDownIdle    time.Duration // default: 10s
+    BatchSize        int           // default: 10
+    LeaseTTL         time.Duration // default: 30s
+    MaxRetries       int           // default: 3
+    Logger           logger.Logger
+    Storage          storage.Storage // default: in-memory
 }
 ```
 
@@ -244,19 +245,113 @@ type Config struct {
 Hydra abstracts persistence behind the `storage.Storage` interface.
 The default is in-memory (suitable for development and testing).
 
-To use a different backend, implement the interface and inject it:
+Each backend is a separate Go module — you import only the one you need.
+
+### Interface
 
 ```go
+import "github.com/zsweiter/hydra/storage"
+
 type Storage interface {
-    SaveJob(ctx, *Job) error
-    ClaimJobs(ctx, QueueName, workerID string, n int, ttl time.Duration) ([]LeasedJob, error)
-    AckJob(ctx, jobID string) error
-    FailJob(ctx, *Job, error) (FailResult, error)
-    SaveSchedule(ctx, *JobSchedule) error
-    DeleteSchedule(ctx, scheduleID string) error
-    LoadActiveSchedules(ctx) ([]*JobSchedule, error)
-    // ... see package docs for full interface
+    // Jobs
+    SaveJob(ctx context.Context, job *domain.Job) error
+    RemoveJob(ctx context.Context, jobID string) error
+    ClaimJobs(ctx context.Context, queue domain.QueueName, workerID string, n int, ttl time.Duration) ([]LeasedJob, error)
+    AckJob(ctx context.Context, jobID string) error
+    FailJob(ctx context.Context, job *domain.Job, failErr error) (FailResult, error)
+
+    // Queue management
+    ReadyQueues(ctx context.Context) ([]domain.QueueName, error)
+    PromoteScheduled(ctx context.Context, now time.Time, limit int) (int, error)
+    RecoverOrphaned(ctx context.Context, before time.Time) (int, error)
+
+    // Schedules
+    SaveSchedule(ctx context.Context, schedule *domain.JobSchedule) error
+    DeleteSchedule(ctx context.Context, scheduleID string) error
+    LoadActiveSchedules(ctx context.Context) ([]*domain.JobSchedule, error)
+    LoadSchedule(ctx context.Context, scheduleID string) (*domain.JobSchedule, error)
+    UpdateScheduleStatus(ctx context.Context, scheduleID string, status domain.ScheduleStatus) error
+    IncrementGeneratedJobs(ctx context.Context, scheduleID string) (int, error)
+    UpdateNextRunAt(ctx context.Context, scheduleID string, nextRun, lastRun time.Time) error
+
+    // Dead-letter
+    ListDLQ(ctx context.Context, queue domain.QueueName) ([]DeadLetter, error)
+    RequeueDLQ(ctx context.Context, jobID string) error
+
+    // Metadata
+    NextScheduledAt(ctx context.Context) (time.Time, error)
+    Stats(ctx context.Context) (Stats, error)
+    Close() error
 }
+```
+
+### SQLite
+
+Uses `mattn/go-sqlite3` (CGo). WAL mode with busy timeout.
+
+```go
+import (
+    "github.com/zsweiter/hydra"
+    "github.com/zsweiter/hydra/storage/sqlite"
+)
+
+func main() {
+    store, err := sqlite.New("file:test.db?mode=memory")             // file path
+    if err != nil { panic(err) }
+
+    q := hydra.New(hydra.Config{Storage: store})
+    // ...
+}
+```
+
+SQLite connection string supports query parameters:
+
+```go
+store, _ := sqlite.New("file:hydra.db?mode=memory&cache=shared")
+```
+
+### Redis
+
+Uses `go-redis/v9`. Accepts any `redis.UniversalClient` (single, cluster, sentinel).
+
+```go
+import (
+    "github.com/redis/go-redis/v9"
+    "github.com/zsweiter/hydra"
+    "github.com/zsweiter/hydra/storage/redis"
+)
+
+func main() {
+    store := redis.New(redis.Options{
+        Addr: "localhost:6379",
+        DB:   0,
+    })
+
+	// Or use custom connection
+    // store := redis.Use(rdb) // rdb instance of redis library
+    q := hydra.New(hydra.Config{Storage: store})
+    // ...
+}
+```
+
+With cluster or sentinel:
+
+```go
+rdb := ioredis.NewClusterClient(&ioredis.ClusterOptions{Addrs: []string{":6379"}})
+store := redis.Use(rdb)
+```
+
+### Custom backend
+
+Implement the `storage.Storage` interface and pass it to `hydra.Config`:
+
+```go
+type MyStorage struct{ /* ... */ }
+
+func (s *MyStorage) SaveJob(ctx context.Context, job *domain.Job) error { /* ... */ }
+// ... implement all 17 methods
+
+q := hydra.New(hydra.Config{Storage: &MyStorage{}})
 ```
 
 ## Architecture

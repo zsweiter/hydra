@@ -15,7 +15,7 @@ import (
 )
 
 func main() {
-	storage, err := sqlite.NewFromOptions(&sqlite.Options{Path: "./datas.db"})
+	storage, err := sqlite.New("./datas.db")
 	if err != nil {
 		log.Fatal(err)
 

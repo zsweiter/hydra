@@ -45,13 +45,13 @@ type Storage struct {
 }
 
 // Open creates a new Redis-backed storage.
-func New(rdb redis.UniversalClient) *Storage {
+func Use(rdb redis.UniversalClient) *Storage {
 	return &Storage{rdb: rdb}
 }
 
 // Create new client based in redis conf
-func NewFromOptions(opt *Options) *Storage {
-	return New(redis.NewClient(&redis.Options{
+func New(opt *Options) *Storage {
+	return Use(redis.NewClient(&redis.Options{
 		Addr:     opt.Addr,
 		DB:       opt.DB,
 		Username: opt.Username,

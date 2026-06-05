@@ -23,7 +23,7 @@ type Storage struct {
 
 // Open opens a SQLite database and initialises the schema.
 // The DSN is opened with WAL journal mode and a busy timeout.
-func New(db *sql.DB) (*Storage, error) {
+func Use(db *sql.DB) (*Storage, error) {
 	db.SetMaxOpenConns(1) // SQLite serialises writes anyway
 
 	s := &Storage{db: db}
@@ -37,14 +37,10 @@ func New(db *sql.DB) (*Storage, error) {
 	return s, nil
 }
 
-type Options struct {
-	Path string
-}
-
 // Open opens a SQLite database and initialises the schema.
 // The DSN is opened with WAL journal mode and a busy timeout.
-func NewFromOptions(op *Options) (*Storage, error) {
-	connStr := op.Path
+func New(path string) (*Storage, error) {
+	connStr := path
 	if connStr == "" {
 		connStr = "file:hydra.db"
 	}
