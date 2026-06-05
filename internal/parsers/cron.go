@@ -1,3 +1,5 @@
+// Cron parser adapted from github.com/robfig/cron (MIT).
+// Copyright (C) 2012 Rob Figueiredo. All Rights Reserved.
 package parsers
 
 import (
