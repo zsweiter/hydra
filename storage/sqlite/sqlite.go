@@ -255,7 +255,7 @@ func (s *Storage) ClaimJobs(ctx context.Context, queue domain.QueueName, workerI
 		schedule_id,
 		idempotency_key,
 		created_at,
-		updated_at 
+		updated_at
 	FROM ha_jobs WHERE queue = ? AND status = 'pending' ORDER BY run_at,priority LIMIT ?`
 
 	rows, err := tx.QueryContext(ctx, query, queue, n)
@@ -308,7 +308,6 @@ func (s *Storage) ClaimJobs(ctx context.Context, queue domain.QueueName, workerI
 		job.Metadata = unmarshalMap(meta)
 		jobs = append(jobs, job)
 	}
-
 	rows.Close()
 
 	if len(jobs) == 0 {
@@ -359,7 +358,7 @@ func (s *Storage) FailJob(ctx context.Context, job *domain.Job, failErr error) (
 			return storage.FailResult{}, err
 		}
 
-		query := `UPDATE ha_jobs SET status = ?, attempts = ,run_at = ?,updated_at = ? WHERE id = ?`
+		query := `UPDATE ha_jobs SET status = ?, attempts = ?, run_at = ?,updated_at = ? WHERE id = ?`
 		_, err = s.db.ExecContext(ctx, query, "pending", job.Attempts, nextRun.UnixMilli(), job.UpdatedAt.UnixMilli(), job.ID)
 		if err != nil {
 			return storage.FailResult{}, err
@@ -369,7 +368,7 @@ func (s *Storage) FailJob(ctx context.Context, job *domain.Job, failErr error) (
 	}
 
 	job.Status = domain.StatusDeadLetter
-	_, err := s.db.ExecContext(ctx, `DELETE FROM ha_leases WHERE job_i d= ?`, job.ID)
+	_, err := s.db.ExecContext(ctx, `DELETE FROM ha_leases WHERE job_id = ?`, job.ID)
 	if err != nil {
 		return storage.FailResult{}, err
 	}
@@ -777,7 +776,7 @@ func (s *Storage) RequeueDLQ(ctx context.Context, jobID string) error {
 	}
 
 	now := time.Now()
-	// Job may still exist in jobs table (as dead_letter status).
+	// Job may still exist in ha_jobs table (as dead_letter status).
 	// Update it back to pending.
 	if _, err := tx.ExecContext(ctx, `UPDATE ha_jobs SET status = 'pending',attempts = 0, run_at = ?, updated_at = ? WHERE id = ?`,
 		now.UnixMilli(), now.UnixMilli(), dl.ID); err != nil {
