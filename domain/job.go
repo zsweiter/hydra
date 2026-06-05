@@ -5,7 +5,7 @@ import "time"
 type JobStatus uint8
 
 const (
-	StatusPending    JobStatus = iota
+	StatusPending JobStatus = iota
 	StatusProcessing
 	StatusCompleted
 	StatusFailed

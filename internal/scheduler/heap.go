@@ -9,7 +9,7 @@ import (
 	"container/heap"
 	"time"
 
-	"github.com/zsweiter/hydra/internal/domain"
+	"github.com/zsweiter/hydra/domain"
 )
 
 // HeapEntry holds the minimum information needed by the

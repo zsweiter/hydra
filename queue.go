@@ -7,13 +7,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/zsweiter/hydra/domain"
 	"github.com/zsweiter/hydra/internal/dispatcher"
-	"github.com/zsweiter/hydra/internal/domain"
 	"github.com/zsweiter/hydra/internal/scheduler"
-	"github.com/zsweiter/hydra/internal/storage"
 	"github.com/zsweiter/hydra/internal/storage/memory"
 	"github.com/zsweiter/hydra/internal/worker"
 	"github.com/zsweiter/hydra/pkg/logger"
+	"github.com/zsweiter/hydra/storage"
 )
 
 // ──────────────────────────────────────────────
@@ -129,9 +129,11 @@ type Worker = func(ctx context.Context, job *Job) error
 type Config struct {
 	MaxRetries int
 
-	MinWorkers    int
-	MaxWorkers    int
-	ScaleDownIdle time.Duration
+	// Config for elastic worker pool
+	MinWorkers         int
+	MaxWorkers         int
+	ScaleUpThreshold   float64 // channel occupancy (0.0–1.0) to trigger scale-up; default 0.25
+	ScaleDownIdle      time.Duration
 
 	BatchSize int
 	LeaseTTL  time.Duration
@@ -240,17 +242,21 @@ func New(cfg Config) *queue {
 	if cfg.ScaleDownIdle <= 0 {
 		cfg.ScaleDownIdle = 10 * time.Second
 	}
+	if cfg.ScaleUpThreshold <= 0 {
+		cfg.ScaleUpThreshold = 0.25
+	}
 
 	registry := worker.NewRegistry()
 
 	disp := dispatcher.New(cfg.Storage, nil, cfg.BatchSize, cfg.LeaseTTL)
 
 	pool := worker.NewPool(registry, cfg.Storage, worker.Config{
-		MinWorkers:    cfg.MinWorkers,
-		MaxWorkers:    cfg.MaxWorkers,
-		LeaseTTL:      cfg.LeaseTTL,
-		ScaleDownIdle: cfg.ScaleDownIdle,
-		OnRetry:       func(_ time.Time) { disp.Signal() },
+		MinWorkers:       cfg.MinWorkers,
+		MaxWorkers:       cfg.MaxWorkers,
+		LeaseTTL:         cfg.LeaseTTL,
+		ScaleDownIdle:    cfg.ScaleDownIdle,
+		ScaleUpThreshold: cfg.ScaleUpThreshold,
+		OnRetry:          func(_ time.Time) { disp.Signal() },
 	})
 
 	disp.SetJobChan(pool.JobChan())

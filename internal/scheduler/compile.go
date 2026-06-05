@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/zsweiter/hydra/internal/domain"
+	"github.com/zsweiter/hydra/domain"
 	"github.com/zsweiter/hydra/internal/parsers"
 )
 

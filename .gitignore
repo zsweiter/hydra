@@ -12,6 +12,8 @@ Thumbs.db
 *.key
 data/
 bin/
+*.db-shm
+*.db-wal
 
 # Build outputs
 dist/
@@ -30,16 +32,8 @@ pkg/queue/*.jsonl
 # Coverage
 coverage/
 
-# Cargo
-/target/
-**/target/
-
-# Rustfmt & Clippy
-.rustfmt.toml
-cargo.lock
-
-# Rust analyzer
-.rust-analyzer/
+# Internal docs
+docs/golang-pro/
 
 .vscode/
 !.vscode/extensions.json

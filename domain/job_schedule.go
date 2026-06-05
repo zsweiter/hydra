@@ -5,7 +5,7 @@ import "time"
 type ScheduleStatus uint8
 
 const (
-	ScheduleActive   ScheduleStatus = iota
+	ScheduleActive ScheduleStatus = iota
 	SchedulePaused
 	ScheduleFinished
 )

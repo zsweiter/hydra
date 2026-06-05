@@ -5,8 +5,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/zsweiter/hydra/internal/domain"
-	"github.com/zsweiter/hydra/internal/storage"
+	"github.com/zsweiter/hydra/domain"
+	"github.com/zsweiter/hydra/storage"
 )
 
 // queueHash computes a 6-bit hash (0-63) from a queue name

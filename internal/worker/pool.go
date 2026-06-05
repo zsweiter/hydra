@@ -7,8 +7,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/zsweiter/hydra/internal/domain"
-	"github.com/zsweiter/hydra/internal/storage"
+	"github.com/zsweiter/hydra/domain"
+	"github.com/zsweiter/hydra/storage"
 )
 
 // Pool is an elastic worker pool that dynamically adjusts
@@ -22,18 +22,20 @@ import (
 // checks for backlog and spawns additional temporary workers
 // as needed. No timer ticker, no polling — zero CPU when idle.
 type Pool struct {
-	registry      *Registry
-	storage       storage.Storage
-	jobChan       chan *domain.Job
-	activeWorkers atomic.Int32
-	minWorkers    int
-	maxWorkers    int
-	batchSize     int
-	leaseTTL      time.Duration
-	scaleDownIdle time.Duration
-	onRetry       func(nextRunAt time.Time)
-	stopChan      chan struct{}
-	wg            sync.WaitGroup
+	registry         *Registry
+	storage          storage.Storage
+	jobChan          chan *domain.Job
+	activeWorkers    atomic.Int32
+	minWorkers       int
+	maxWorkers       int
+	batchSize        int
+	leaseTTL         time.Duration
+	scaleDownIdle    time.Duration
+	scaleUpThreshold float64
+	bufCap           int
+	onRetry          func(nextRunAt time.Time)
+	stopChan         chan struct{}
+	wg               sync.WaitGroup
 }
 
 // Config holds configuration for the worker pool.
@@ -43,6 +45,10 @@ type Config struct {
 	BatchSize     int
 	LeaseTTL      time.Duration
 	ScaleDownIdle time.Duration
+
+	// ScaleUpThreshold is the channel occupancy (0.0–1.0) that
+	// triggers spawning a temporary worker. Default 0.25.
+	ScaleUpThreshold float64
 
 	// OnRetry is called when a job fails and is rescheduled
 	// for retry. The nextRunAt is the time the job will be
@@ -64,19 +70,24 @@ func NewPool(registry *Registry, s storage.Storage, cfg Config) *Pool {
 	if cfg.ScaleDownIdle <= 0 {
 		cfg.ScaleDownIdle = 10 * time.Second
 	}
+	if cfg.ScaleUpThreshold <= 0 {
+		cfg.ScaleUpThreshold = 0.25
+	}
 
 	chanSize := max(cfg.MaxWorkers*4, 16)
 
 	return &Pool{
-		registry:      registry,
-		storage:       s,
-		jobChan:       make(chan *domain.Job, chanSize),
-		minWorkers:    cfg.MinWorkers,
-		maxWorkers:    cfg.MaxWorkers,
-		leaseTTL:      cfg.LeaseTTL,
-		scaleDownIdle: cfg.ScaleDownIdle,
-		onRetry:       cfg.OnRetry,
-		stopChan:      make(chan struct{}),
+		registry:         registry,
+		storage:          s,
+		jobChan:          make(chan *domain.Job, chanSize),
+		minWorkers:       cfg.MinWorkers,
+		maxWorkers:       cfg.MaxWorkers,
+		leaseTTL:         cfg.LeaseTTL,
+		scaleDownIdle:    cfg.ScaleDownIdle,
+		scaleUpThreshold: cfg.ScaleUpThreshold,
+		bufCap:           chanSize,
+		onRetry:          cfg.OnRetry,
+		stopChan:         make(chan struct{}),
 	}
 }
 
@@ -182,17 +193,17 @@ func (p *Pool) processJob(job *domain.Job) {
 	}
 }
 
-// maybeScale spawns a temporary worker if there's backlog
-// and we haven't reached maxWorkers. Called by workers after
-// processing a job.
+// maybeScale spawns a temporary worker when channel occupancy
+// exceeds ScaleUpThreshold. Called by workers after processing
+// a job. Workers self-destruct after ScaleDownIdle of inactivity.
 func (p *Pool) maybeScale() {
 	active := p.activeWorkers.Load()
 	if active >= int32(p.maxWorkers) {
 		return
 	}
 
-	backlog := len(p.jobChan)
-	if backlog == 0 {
+	occupancy := float64(len(p.jobChan)) / float64(p.bufCap)
+	if occupancy < p.scaleUpThreshold {
 		return
 	}
 

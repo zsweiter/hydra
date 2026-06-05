@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zsweiter/hydra/internal/domain"
-	"github.com/zsweiter/hydra/internal/storage"
+	"github.com/zsweiter/hydra/domain"
+	"github.com/zsweiter/hydra/storage"
 )
 
 type leaseEntry struct {
@@ -92,10 +92,7 @@ func (s *Storage) ClaimJobs(_ context.Context, queue domain.QueueName, workerID 
 		return nil, nil
 	}
 
-	batch := n
-	if batch > len(ready) {
-		batch = len(ready)
-	}
+	batch := min(n, len(ready))
 
 	jobs := make([]*domain.Job, batch)
 	copy(jobs, ready[:batch])

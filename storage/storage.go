@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/zsweiter/hydra/internal/domain"
+	"github.com/zsweiter/hydra/domain"
 )
 
 // LeasedJob represents a job that has been claimed

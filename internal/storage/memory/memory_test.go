@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zsweiter/hydra/internal/domain"
+	"github.com/zsweiter/hydra/domain"
 )
 
 func TestSaveAndClaimJob(t *testing.T) {

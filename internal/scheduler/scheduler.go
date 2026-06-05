@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zsweiter/hydra/internal/domain"
-	"github.com/zsweiter/hydra/internal/storage"
+	"github.com/zsweiter/hydra/domain"
+	"github.com/zsweiter/hydra/storage"
 )
 
 // SignalFunc is a lightweight notification callback used
@@ -80,6 +80,7 @@ func (s *Scheduler) Signal() {
 	select {
 	case s.sigChan <- struct{}{}:
 	default:
+		// drop duplicate signal
 	}
 }
 
@@ -88,6 +89,7 @@ func (s *Scheduler) Notify(event Event) {
 	select {
 	case s.events <- event:
 	default:
+		// drop duplicate signal
 	}
 }
 
@@ -135,10 +137,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			continue
 		}
 
-		wait := time.Duration(next.NextRunNanos-time.Now().UnixNano()) * time.Nanosecond
-		if wait < 0 {
-			wait = 0
-		}
+		wait := max(time.Duration(next.NextRunNanos-time.Now().UnixNano())*time.Nanosecond, 0)
 
 		timer := time.NewTimer(wait)
 		select {

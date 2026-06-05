@@ -5,7 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/zsweiter/hydra/internal/domain"
+	"github.com/zsweiter/hydra/domain"
 )
 
 // Worker is a function that processes a job.
