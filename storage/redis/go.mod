@@ -4,7 +4,7 @@ go 1.26.1
 
 require (
 	github.com/redis/go-redis/v9 v9.7.1
-	github.com/zsweiter/hydra v0.1.1
+	github.com/zsweiter/hydra v0.1.3
 )
 
 require (

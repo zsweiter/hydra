@@ -125,15 +125,19 @@ func DefaultBackoff() BackoffPolicy {
 // Worker is a function that processes a job.
 type Worker = func(ctx context.Context, job *Job) error
 
+type Processor interface {
+	Handle(ctx context.Context, job *Job) error
+}
+
 // Config holds all configuration for a hydra instance.
 type Config struct {
 	MaxRetries int
 
 	// Config for elastic worker pool
-	MinWorkers         int
-	MaxWorkers         int
-	ScaleUpThreshold   float64 // channel occupancy (0.0–1.0) to trigger scale-up; default 0.25
-	ScaleDownIdle      time.Duration
+	MinWorkers       int
+	MaxWorkers       int
+	ScaleUpThreshold float64 // channel occupancy (0.0–1.0) to trigger scale-up; default 0.25
+	ScaleDownIdle    time.Duration
 
 	BatchSize int
 	LeaseTTL  time.Duration
@@ -184,6 +188,7 @@ type Producer interface {
 // Consumer is the public API for registering workers.
 type Consumer interface {
 	Handle(queue QueueName, worker Worker)
+	Process(queue QueueName, processor Processor)
 }
 
 // Queue is the single public entry point for hydra.
@@ -400,6 +405,10 @@ func (q *queue) ResumeSchedule(ctx context.Context, queueName QueueName, schedul
 
 func (q *queue) Handle(queueName QueueName, worker Worker) {
 	q.registry.Register(queueName, worker)
+}
+
+func (q *queue) Process(queueName QueueName, processor Processor) {
+	q.registry.Register(queueName, processor.Handle)
 }
 
 func (q *queue) Pause(_ context.Context, queueName QueueName) error {
