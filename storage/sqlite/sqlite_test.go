@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -21,6 +22,12 @@ func newDB(t testing.TB) *Storage {
 	return s
 }
 
+func failJob(t testing.TB, s *Storage, ctx context.Context, job *domain.Job, failErr error) (*storage.FailResult, error) {
+	t.Helper()
+	decision := domain.ComputeFailDecision(job, time.Now().UTC())
+	return s.FailJob(ctx, job, failErr, decision)
+}
+
 // ──────────────────────────────────────────────
 //  Basic operations
 // ──────────────────────────────────────────────
@@ -29,7 +36,7 @@ func TestSaveAndClaimJob(t *testing.T) {
 	s := newDB(t)
 	ctx := context.Background()
 
-	job := &domain.Job{ID: "j1", Name: "test", Queue: "emails", Data: []byte("hello")}
+	job := &domain.Job{Status: domain.StatusPending, ID: "j1", Name: "test", Queue: "emails", Data: []byte("hello")}
 	if err := s.SaveJob(ctx, job); err != nil {
 		t.Fatal(err)
 	}
@@ -61,21 +68,37 @@ func TestClaimEmptyQueue(t *testing.T) {
 func TestAckJob(t *testing.T) {
 	s := newDB(t)
 	ctx := context.Background()
-	s.SaveJob(ctx, &domain.Job{ID: "j1", Queue: "emails"})
+	s.SaveJob(ctx, &domain.Job{Status: domain.StatusPending, ID: "j1", Queue: "emails"})
 	leased, _ := s.ClaimJobs(ctx, "emails", "w1", 10, time.Minute)
 	if err := s.AckJob(ctx, leased[0].Job.ID); err != nil {
 		t.Fatal(err)
+	}
+
+	var status string
+	if err := s.db.QueryRowContext(ctx, `SELECT status FROM ha_jobs WHERE id = ?`, "j1").Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "completed" {
+		t.Fatalf("expected job marked completed, got %q", status)
+	}
+
+	released, err := s.ClaimJobs(ctx, "emails", "w1", 10, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(released) != 0 {
+		t.Fatalf("completed job claimed again, got %d", len(released))
 	}
 }
 
 func TestFailJobRetry(t *testing.T) {
 	s := newDB(t)
 	ctx := context.Background()
-	job := &domain.Job{ID: "j1", Queue: "emails", MaxAttempts: 3, Backoff: domain.DefaultBackoff()}
+	job := &domain.Job{Status: domain.StatusPending, ID: "j1", Queue: "emails", MaxAttempts: 3, Backoff: domain.DefaultBackoff()}
 	s.SaveJob(ctx, job)
 	leased, _ := s.ClaimJobs(ctx, "emails", "w1", 10, time.Minute)
 
-	result, err := s.FailJob(ctx, leased[0].Job, fmt.Errorf("test error"))
+	result, err := failJob(t, s, ctx, leased[0].Job, fmt.Errorf("test error"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,11 +110,11 @@ func TestFailJobRetry(t *testing.T) {
 func TestFailJobDeadLetter(t *testing.T) {
 	s := newDB(t)
 	ctx := context.Background()
-	job := &domain.Job{ID: "j1", Queue: "emails", MaxAttempts: 1, Attempts: 1, Backoff: domain.DefaultBackoff()}
+	job := &domain.Job{Status: domain.StatusPending, ID: "j1", Queue: "emails", MaxAttempts: 1, Attempts: 1, Backoff: domain.DefaultBackoff()}
 	s.SaveJob(ctx, job)
 	leased, _ := s.ClaimJobs(ctx, "emails", "w1", 10, time.Minute)
 
-	result, err := s.FailJob(ctx, leased[0].Job, fmt.Errorf("dead"))
+	result, err := failJob(t, s, ctx, leased[0].Job, fmt.Errorf("dead"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,8 +135,8 @@ func TestDelayedJobIsNotReady(t *testing.T) {
 	s := newDB(t)
 	ctx := context.Background()
 
-	future := time.Now().Add(time.Hour)
-	s.SaveJob(ctx, &domain.Job{ID: "future", Queue: "q", RunAt: future})
+	future := time.Now().UTC().Add(time.Hour)
+	s.SaveJob(ctx, &domain.Job{ID: "future", Queue: "q", RunAt: future, Status: domain.StatusScheduled})
 
 	leased, err := s.ClaimJobs(ctx, "q", "w1", 10, time.Minute)
 	if err != nil {
@@ -129,11 +152,11 @@ func TestDelayedJobIsPromoted(t *testing.T) {
 	ctx := context.Background()
 
 	// Save a job with RunAt in the future → stored as "scheduled"
-	future := time.Now().Add(time.Hour)
-	s.SaveJob(ctx, &domain.Job{ID: "due", Queue: "q", RunAt: future})
+	future := time.Now().UTC().Add(time.Hour)
+	s.SaveJob(ctx, &domain.Job{ID: "due", Queue: "q", RunAt: future, Status: domain.StatusScheduled})
 
 	// Before time, PromoteScheduled should do nothing
-	now := time.Now()
+	now := time.Now().UTC()
 	n, err := s.PromoteScheduled(ctx, now, 10)
 	if err != nil {
 		t.Fatal(err)
@@ -161,10 +184,10 @@ func TestDelayedJobNotPromotedBeforeTime(t *testing.T) {
 	s := newDB(t)
 	ctx := context.Background()
 
-	future := time.Now().Add(time.Hour)
-	s.SaveJob(ctx, &domain.Job{ID: "future", Queue: "q", RunAt: future})
+	future := time.Now().UTC().Add(time.Hour)
+	s.SaveJob(ctx, &domain.Job{ID: "future", Queue: "q", RunAt: future, Status: domain.StatusScheduled})
 
-	n, err := s.PromoteScheduled(ctx, time.Now(), 10)
+	n, err := s.PromoteScheduled(ctx, time.Now().UTC(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,6 +259,35 @@ func TestScheduleStatusUpdate(t *testing.T) {
 	}
 }
 
+func TestScheduleEnumsPersistedAsText(t *testing.T) {
+	s := newDB(t)
+	ctx := context.Background()
+
+	sch := &domain.JobSchedule{
+		ID:            "s1",
+		Queue:         "q",
+		Status:        domain.SchedulePaused,
+		MisfirePolicy: domain.MisfireCatchUp,
+		Rule:          domain.NewIntervalScheduleRule(time.Minute),
+	}
+	if err := s.SaveSchedule(ctx, sch); err != nil {
+		t.Fatal(err)
+	}
+
+	var status, misfire string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT status, misfire_policy FROM ha_schedules WHERE id = ?`, "s1").Scan(&status, &misfire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "paused" {
+		t.Fatalf("status persisted as %q, want %q", status, "paused")
+	}
+	if misfire != "catch_up" {
+		t.Fatalf("misfire_policy persisted as %q, want %q", misfire, "catch_up")
+	}
+}
+
 func TestIncrementGeneratedJobs(t *testing.T) {
 	s := newDB(t)
 	ctx := context.Background()
@@ -260,8 +312,8 @@ func TestUpdateNextRunAt(t *testing.T) {
 	ctx := context.Background()
 	s.SaveSchedule(ctx, &domain.JobSchedule{ID: "s1", Queue: "q", Status: domain.ScheduleActive})
 
-	next := time.Now().Add(time.Hour)
-	last := time.Now()
+	next := time.Now().UTC().Add(time.Hour)
+	last := time.Now().UTC()
 	s.UpdateNextRunAt(ctx, "s1", next, last)
 
 	sch, _ := s.LoadSchedule(ctx, "s1")
@@ -282,10 +334,10 @@ func TestListDLQ(t *testing.T) {
 	ctx := context.Background()
 
 	// Fail job to create DLQ entry
-	job := &domain.Job{ID: "d1", Queue: "q", MaxAttempts: 1, Attempts: 1, Backoff: domain.DefaultBackoff()}
+	job := &domain.Job{Status: domain.StatusPending, ID: "d1", Queue: "q", MaxAttempts: 1, Attempts: 1, Backoff: domain.DefaultBackoff()}
 	s.SaveJob(ctx, job)
 	leased, _ := s.ClaimJobs(ctx, "q", "w1", 10, time.Minute)
-	s.FailJob(ctx, leased[0].Job, fmt.Errorf("fail"))
+	failJob(t, s, ctx, leased[0].Job, fmt.Errorf("fail"))
 
 	dlq, err := s.ListDLQ(ctx, "")
 	if err != nil {
@@ -300,10 +352,10 @@ func TestRequeueDLQ(t *testing.T) {
 	s := newDB(t)
 	ctx := context.Background()
 
-	job := &domain.Job{ID: "d1", Queue: "q", MaxAttempts: 1, Attempts: 1, Backoff: domain.DefaultBackoff()}
+	job := &domain.Job{Status: domain.StatusPending, ID: "d1", Queue: "q", MaxAttempts: 1, Attempts: 1, Backoff: domain.DefaultBackoff()}
 	s.SaveJob(ctx, job)
 	leased, _ := s.ClaimJobs(ctx, "q", "w1", 10, time.Minute)
-	s.FailJob(ctx, leased[0].Job, fmt.Errorf("fail"))
+	failJob(t, s, ctx, leased[0].Job, fmt.Errorf("fail"))
 
 	if err := s.RequeueDLQ(ctx, "d1"); err != nil {
 		t.Fatal(err)
@@ -329,10 +381,10 @@ func TestStatsCounts(t *testing.T) {
 	s := newDB(t)
 	ctx := context.Background()
 
-	s.SaveJob(ctx, &domain.Job{ID: "j1", Queue: "q1"})
-	s.SaveJob(ctx, &domain.Job{ID: "j2", Queue: "q1"})
-	s.SaveJob(ctx, &domain.Job{ID: "j3", Queue: "q2"})
-	s.SaveJob(ctx, &domain.Job{ID: "j4", Queue: "q2", RunAt: time.Now().Add(time.Hour)})
+	s.SaveJob(ctx, &domain.Job{Status: domain.StatusPending, ID: "j1", Queue: "q1"})
+	s.SaveJob(ctx, &domain.Job{Status: domain.StatusPending, ID: "j2", Queue: "q1"})
+	s.SaveJob(ctx, &domain.Job{Status: domain.StatusPending, ID: "j3", Queue: "q2"})
+	s.SaveJob(ctx, &domain.Job{ID: "j4", Queue: "q2", RunAt: time.Now().UTC().Add(time.Hour), Status: domain.StatusScheduled})
 
 	stats, err := s.Stats(ctx)
 	if err != nil {
@@ -356,19 +408,37 @@ func TestStatsCounts(t *testing.T) {
 func TestRemoveNonExistentJob(t *testing.T) {
 	s := newDB(t)
 	ctx := context.Background()
-	if err := s.RemoveJob(ctx, "nonexistent"); err == nil {
-		t.Fatal("expected error for non-existent job")
+	if err := s.RemoveJob(ctx, "nonexistent"); !errors.Is(err, storage.ErrConflict) {
+		t.Fatalf("expected ErrConflict, got %v", err)
 	}
 }
 
 func TestRemoveProcessingJob(t *testing.T) {
 	s := newDB(t)
 	ctx := context.Background()
-	s.SaveJob(ctx, &domain.Job{ID: "j1", Queue: "q"})
+	s.SaveJob(ctx, &domain.Job{Status: domain.StatusPending, ID: "j1", Queue: "q"})
 	s.ClaimJobs(ctx, "q", "w1", 10, time.Minute)
 
-	if err := s.RemoveJob(ctx, "j1"); err == nil {
-		t.Fatal("expected error when removing processing job")
+	if err := s.RemoveJob(ctx, "j1"); !errors.Is(err, storage.ErrConflict) {
+		t.Fatalf("expected ErrConflict, got %v", err)
+	}
+}
+
+func TestLoadScheduleNotFound(t *testing.T) {
+	s := newDB(t)
+	ctx := context.Background()
+
+	if _, err := s.LoadSchedule(ctx, "missing"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestRequeueDLQNotFound(t *testing.T) {
+	s := newDB(t)
+	ctx := context.Background()
+
+	if err := s.RequeueDLQ(ctx, "missing"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
 
@@ -379,11 +449,11 @@ func TestRemoveProcessingJob(t *testing.T) {
 func TestRecoverOrphaned(t *testing.T) {
 	s := newDB(t)
 	ctx := context.Background()
-	s.SaveJob(ctx, &domain.Job{ID: "orphan", Queue: "q"})
+	s.SaveJob(ctx, &domain.Job{Status: domain.StatusPending, ID: "orphan", Queue: "q"})
 	s.ClaimJobs(ctx, "q", "w1", 10, time.Millisecond)
 	time.Sleep(2 * time.Millisecond)
 
-	recovered, err := s.RecoverOrphaned(ctx, time.Now())
+	recovered, err := s.RecoverOrphaned(ctx, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +465,7 @@ func TestRecoverOrphaned(t *testing.T) {
 func TestRecoverNoOrphans(t *testing.T) {
 	s := newDB(t)
 	ctx := context.Background()
-	n, err := s.RecoverOrphaned(ctx, time.Now())
+	n, err := s.RecoverOrphaned(ctx, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,8 +482,8 @@ func TestNextScheduledAt(t *testing.T) {
 	s := newDB(t)
 	ctx := context.Background()
 
-	future := time.Now().Add(time.Hour)
-	s.SaveJob(ctx, &domain.Job{ID: "future", Queue: "q", RunAt: future})
+	future := time.Now().UTC().Add(time.Hour)
+	s.SaveJob(ctx, &domain.Job{ID: "future", Queue: "q", RunAt: future, Status: domain.StatusScheduled})
 	// With the fix, delayed jobs are stored as "scheduled" status.
 	// NextScheduledAt queries for status='scheduled'.
 	next, err := s.NextScheduledAt(ctx)
@@ -440,7 +510,7 @@ func TestConcurrentSaveAndClaim(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			id := fmt.Sprintf("c-%d", i)
-			s.SaveJob(ctx, &domain.Job{ID: id, Queue: "concurrent"})
+			s.SaveJob(ctx, &domain.Job{Status: domain.StatusPending, ID: id, Queue: "concurrent"})
 		}(i)
 	}
 	wg.Wait()
@@ -490,7 +560,7 @@ func BenchmarkSaveJob(b *testing.B) {
 	ctx := context.Background()
 	b.ResetTimer()
 	for b.Loop() {
-		s.SaveJob(ctx, &domain.Job{ID: fmt.Sprintf("b-%d", b.N), Queue: "bench"})
+		s.SaveJob(ctx, &domain.Job{Status: domain.StatusPending, ID: fmt.Sprintf("b-%d", b.N), Queue: "bench"})
 	}
 }
 
@@ -500,7 +570,7 @@ func BenchmarkClaimAndAck(b *testing.B) {
 
 	// Pre-load jobs
 	for i := 0; i < 1000; i++ {
-		s.SaveJob(ctx, &domain.Job{ID: fmt.Sprintf("pre-%d", i), Queue: "bench"})
+		s.SaveJob(ctx, &domain.Job{Status: domain.StatusPending, ID: fmt.Sprintf("pre-%d", i), Queue: "bench"})
 	}
 	b.ResetTimer()
 
@@ -521,11 +591,11 @@ func BenchmarkFailRetry(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		id := fmt.Sprintf("fail-%d", b.N)
-		job := &domain.Job{ID: id, Queue: "bench", MaxAttempts: 3, Backoff: domain.DefaultBackoff()}
+		job := &domain.Job{Status: domain.StatusPending, ID: id, Queue: "bench", MaxAttempts: 3, Backoff: domain.DefaultBackoff()}
 		s.SaveJob(ctx, job)
 		leased, _ := s.ClaimJobs(ctx, "bench", "w1", 10, time.Minute)
 		if len(leased) > 0 {
-			s.FailJob(ctx, leased[0].Job, fmt.Errorf("err"))
+			failJob(b, s, ctx, leased[0].Job, fmt.Errorf("err"))
 		}
 	}
 }
@@ -543,13 +613,13 @@ func BenchmarkSaveSchedule(b *testing.B) {
 func BenchmarkPromoteScheduled(b *testing.B) {
 	s := newDB(b)
 	ctx := context.Background()
-	past := time.Now().Add(-time.Hour)
+	past := time.Now().UTC().Add(-time.Hour)
 	for i := range 100 {
-		s.SaveJob(ctx, &domain.Job{ID: fmt.Sprintf("d-%d", i), Queue: "bench", RunAt: past})
+		s.SaveJob(ctx, &domain.Job{Status: domain.StatusPending, ID: fmt.Sprintf("d-%d", i), Queue: "bench", RunAt: past})
 	}
 	b.ResetTimer()
 	for b.Loop() {
-		s.PromoteScheduled(ctx, time.Now(), 100)
+		s.PromoteScheduled(ctx, time.Now().UTC(), 100)
 	}
 }
 
@@ -557,10 +627,131 @@ func BenchmarkStats(b *testing.B) {
 	s := newDB(b)
 	ctx := context.Background()
 	for i := range 100 {
-		s.SaveJob(ctx, &domain.Job{ID: fmt.Sprintf("st-%d", i), Queue: "bench"})
+		s.SaveJob(ctx, &domain.Job{Status: domain.StatusPending, ID: fmt.Sprintf("st-%d", i), Queue: "bench"})
 	}
 	b.ResetTimer()
 	for b.Loop() {
 		s.Stats(ctx)
+	}
+}
+
+// Hydra is a time-driven scheduler: timestamps reconstructed from
+// storage must be UTC so scheduling math stays timezone-stable.
+
+func assertUTCLocation(t *testing.T, field string, ts time.Time) {
+	t.Helper()
+
+	if ts.Location() != time.UTC {
+		t.Fatalf("%s location = %v, want UTC", field, ts.Location())
+	}
+}
+
+func TestNextScheduledAtIsUTC(t *testing.T) {
+	s := newDB(t)
+	ctx := context.Background()
+
+	runAt := time.Now().UTC().Add(time.Hour)
+	if err := s.SaveJob(ctx, &domain.Job{ID: "future", Queue: "q", RunAt: runAt, Status: domain.StatusScheduled}); err != nil {
+		t.Fatal(err)
+	}
+
+	next, err := s.NextScheduledAt(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if next.IsZero() {
+		t.Fatal("expected a scheduled job")
+	}
+
+	assertUTCLocation(t, "NextScheduledAt", next)
+}
+
+func TestLoadScheduleTimestampsAreUTC(t *testing.T) {
+	s := newDB(t)
+	ctx := context.Background()
+
+	sch := &domain.JobSchedule{
+		ID:     "sched-1",
+		Name:   "test-schedule",
+		Queue:  "emails",
+		Status: domain.ScheduleActive,
+		Rule:   domain.NewIntervalScheduleRule(time.Minute),
+	}
+	if err := s.SaveSchedule(ctx, sch); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := s.LoadSchedule(ctx, "sched-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertUTCLocation(t, "CreatedAt", loaded.CreatedAt)
+	assertUTCLocation(t, "UpdatedAt", loaded.UpdatedAt)
+}
+
+func TestDrainQueue(t *testing.T) {
+	s := newDB(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+	future := now.Add(time.Hour)
+
+	for i := 0; i < 3; i++ {
+		if err := s.SaveJob(ctx, &domain.Job{Status: domain.StatusPending, ID: fmt.Sprintf("ready-%d", i), Queue: "q1", RunAt: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if err := s.SaveJob(ctx, &domain.Job{ID: fmt.Sprintf("sched-%d", i), Queue: "q1", RunAt: future, Status: domain.StatusScheduled}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := s.SaveJob(ctx, &domain.Job{Status: domain.StatusPending, ID: "other-ready", Queue: "q2", RunAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveJob(ctx, &domain.Job{ID: "other-sched", Queue: "q2", RunAt: future, Status: domain.StatusScheduled}); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.DrainQueue(ctx, "q1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 {
+		t.Fatalf("expected 5 jobs drained, got %d", n)
+	}
+
+	st, err := s.Stats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st.ReadyCount["q1"]; got != 0 {
+		t.Fatalf("expected q1 ready drained, got %d", got)
+	}
+	if got := st.ReadyCount["q2"]; got != 1 {
+		t.Fatalf("expected q2 untouched, got %d", got)
+	}
+	if got := st.ScheduledCount; got != 1 {
+		t.Fatalf("expected only q2 scheduled remaining, got %d", got)
+	}
+}
+
+func TestSaveJobStatusIsAuthoritative(t *testing.T) {
+	s := newDB(t)
+	ctx := context.Background()
+
+	s.SaveJob(ctx, &domain.Job{ID: "deferred", Queue: "emails", RunAt: time.Now().UTC(), Status: domain.StatusScheduled})
+	leased, _ := s.ClaimJobs(ctx, "emails", "w1", 10, time.Minute)
+	if len(leased) != 0 {
+		t.Fatal("scheduled job claimed before promotion")
+	}
+
+	s.SaveJob(ctx, &domain.Job{ID: "eager", Queue: "emails", RunAt: time.Now().UTC().Add(time.Hour), Status: domain.StatusPending})
+	leased, _ = s.ClaimJobs(ctx, "emails", "w1", 10, time.Minute)
+	if len(leased) != 1 || leased[0].Job.ID != "eager" {
+		t.Fatal("pending job not claimable")
 	}
 }

@@ -301,7 +301,7 @@ func NewCronParser(options ParseOption) *CronParser {
 // It accepts crontab specs and features configured by NewParser.
 func (p CronParser) Parse(pattern string) (Schedule, error) {
 	if len(pattern) == 0 {
-		return nil, fmt.Errorf("empty spec string")
+		return nil, ErrEmptyPattern
 	}
 
 	// Extract timezone if present
@@ -313,6 +313,7 @@ func (p CronParser) Parse(pattern string) (Schedule, error) {
 		if loc, err = time.LoadLocation(pattern[eq+1 : i]); err != nil {
 			return nil, fmt.Errorf("provided bad location %s: %v", pattern[eq+1:i], err)
 		}
+
 		pattern = strings.TrimSpace(pattern[i:])
 	}
 
@@ -426,6 +427,7 @@ func normalizeFields(fields []string, options ParseOption) ([]string, error) {
 			n++
 		}
 	}
+
 	return expandedFields, nil
 }
 
@@ -456,6 +458,7 @@ func getField(field string, r bounds) (uint64, error) {
 		}
 		bits |= bit
 	}
+
 	return bits, nil
 }
 
@@ -472,33 +475,33 @@ func getRange(expr string, r bounds) (uint64, error) {
 
 	var extra uint64
 
-	slashIdx := strings.IndexByte(expr, '/')
+	before, after, ok := strings.Cut(expr, "/")
 	rangePart := expr
 	stepStr := ""
-	if slashIdx >= 0 {
-		rangePart = expr[:slashIdx]
-		stepStr = expr[slashIdx+1:]
+	if ok {
+		rangePart = before
+		stepStr = after
 	}
 
-	dashIdx := strings.IndexByte(rangePart, '-')
-	singleDigit := dashIdx < 0
+	before0, after0, ok0 := strings.Cut(rangePart, "-")
+	singleDigit := !ok0
 
 	if rangePart == "*" || rangePart == "?" {
 		start = r.min
 		end = r.max
 		extra = starBit
-	} else if dashIdx < 0 {
+	} else if !ok0 {
 		start, err = parseIntOrName(rangePart, r.names)
 		if err != nil {
 			return 0, err
 		}
 		end = start
 	} else {
-		start, err = parseIntOrName(rangePart[:dashIdx], r.names)
+		start, err = parseIntOrName(before0, r.names)
 		if err != nil {
 			return 0, err
 		}
-		rest := rangePart[dashIdx+1:]
+		rest := after0
 		if strings.IndexByte(rest, '-') >= 0 {
 			return 0, fmt.Errorf("too many hyphens: %s", expr)
 		}
@@ -508,7 +511,7 @@ func getRange(expr string, r bounds) (uint64, error) {
 		}
 	}
 
-	if slashIdx >= 0 {
+	if ok {
 		step, err = mustParseInt(stepStr)
 		if err != nil {
 			return 0, err
@@ -547,6 +550,7 @@ func parseIntOrName(expr string, names map[string]uint) (uint, error) {
 			return namedInt, nil
 		}
 	}
+
 	return mustParseInt(expr)
 }
 
@@ -576,6 +580,7 @@ func getBits(min, max, step uint) uint64 {
 	for i := min; i <= max; i += step {
 		bits |= 1 << i
 	}
+
 	return bits
 }
 
@@ -584,10 +589,31 @@ func all(r bounds) uint64 {
 	return getBits(r.min, r.max, 1) | starBit
 }
 
-// parseDescriptor returns a predefined schedule for the expression, or error if none matches.
+const (
+	DescriptorYearly   = "@yearly"
+	DescriptorAnnually = "@annually"
+	DescriptorMonthly  = "@monthly"
+	DescriptorWeekly   = "@weekly"
+	DescriptorDaily    = "@daily"
+	DescriptorMidnight = "@midnight"
+	DescriptorHourly   = "@hourly"
+	DescriptorEvery    = "@every "
+)
+
+// parseDescriptor parses a predefined schedule descriptor.
+//
+// Supported descriptors are:
+//   - @yearly / @annually: once a year at midnight on January 1.
+//   - @monthly: once a month at midnight on the first day.
+//   - @weekly: once a week at midnight on Sunday.
+//   - @daily / @midnight: once a day at midnight.
+//   - @hourly: once an hour at the beginning of the hour.
+//   - @every <duration>: executes at the specified duration interval.
+//
+// The schedule uses loc for timezone-aware calculations.
 func parseDescriptor(descriptor string, loc *time.Location) (Schedule, error) {
 	switch descriptor {
-	case "@yearly", "@annually":
+	case DescriptorYearly, DescriptorAnnually:
 		return &SpecSchedule{
 			Second:   1 << seconds.min,
 			Minute:   1 << minutes.min,
@@ -598,7 +624,7 @@ func parseDescriptor(descriptor string, loc *time.Location) (Schedule, error) {
 			Location: loc,
 		}, nil
 
-	case "@monthly":
+	case DescriptorMonthly:
 		return &SpecSchedule{
 			Second:   1 << seconds.min,
 			Minute:   1 << minutes.min,
@@ -609,7 +635,7 @@ func parseDescriptor(descriptor string, loc *time.Location) (Schedule, error) {
 			Location: loc,
 		}, nil
 
-	case "@weekly":
+	case DescriptorWeekly:
 		return &SpecSchedule{
 			Second:   1 << seconds.min,
 			Minute:   1 << minutes.min,
@@ -620,7 +646,7 @@ func parseDescriptor(descriptor string, loc *time.Location) (Schedule, error) {
 			Location: loc,
 		}, nil
 
-	case "@daily", "@midnight":
+	case DescriptorDaily, DescriptorMidnight:
 		return &SpecSchedule{
 			Second:   1 << seconds.min,
 			Minute:   1 << minutes.min,
@@ -631,7 +657,7 @@ func parseDescriptor(descriptor string, loc *time.Location) (Schedule, error) {
 			Location: loc,
 		}, nil
 
-	case "@hourly":
+	case DescriptorHourly:
 		return &SpecSchedule{
 			Second:   1 << seconds.min,
 			Minute:   1 << minutes.min,
@@ -641,15 +667,20 @@ func parseDescriptor(descriptor string, loc *time.Location) (Schedule, error) {
 			Dow:      all(dow),
 			Location: loc,
 		}, nil
-
 	}
 
-	const every = "@every "
-	if strings.HasPrefix(descriptor, every) {
-		duration, err := time.ParseDuration(descriptor[len(every):])
+	if strings.HasPrefix(descriptor, DescriptorEvery) {
+		duration, err := time.ParseDuration(
+			descriptor[len(DescriptorEvery):],
+		)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse duration %s: %s", descriptor, err)
+			return nil, fmt.Errorf(
+				"failed to parse duration %s: %s",
+				descriptor,
+				err,
+			)
 		}
+
 		return Every(duration), nil
 	}
 

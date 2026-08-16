@@ -9,16 +9,6 @@ import (
 	"github.com/zsweiter/hydra/storage"
 )
 
-// queueHash computes a 6-bit hash (0-63) from a queue name
-// for use in the paused-queues bitmask.
-func queueHash(name domain.QueueName) uint64 {
-	var h uint64
-	for i := 0; i < len(name); i++ {
-		h = h*31 + uint64(name[i])
-	}
-	return h & 63
-}
-
 // Dispatcher claims jobs from storage and feeds them into
 // the worker pool's job channel.
 //
@@ -48,7 +38,7 @@ func New(s storage.Storage, jobChan chan<- *domain.Job, batchSize int, leaseTTL 
 		signal:    make(chan struct{}, 1),
 		batchSize: batchSize,
 		leaseTTL:  leaseTTL,
-		workerID:  "dispatcher-" + time.Now().Format("150405"),
+		workerID:  "dispatcher-" + time.Now().UTC().Format("150405"),
 	}
 }
 
@@ -73,13 +63,13 @@ func (d *Dispatcher) Signal() {
 // a specific queue. Queue names are hashed; collisions result
 // in both queues being paused (safe, max 64 queues).
 func (d *Dispatcher) PauseQueue(queue domain.QueueName) {
-	mask := uint64(1) << queueHash(queue)
+	mask := uint64(1) << queue.Bit()
 	d.paused.Or(mask)
 }
 
 // ResumeQueue re-enables job claiming for a specific queue.
 func (d *Dispatcher) ResumeQueue(queue domain.QueueName) {
-	mask := ^(uint64(1) << queueHash(queue))
+	mask := ^(uint64(1) << queue.Bit())
 	d.paused.And(mask)
 }
 
@@ -127,7 +117,7 @@ func (d *Dispatcher) drain(ctx context.Context) {
 		default:
 		}
 
-		if _, err := d.storage.PromoteScheduled(ctx, time.Now(), d.batchSize); err != nil {
+		if _, err := d.storage.PromoteScheduled(ctx, time.Now().UTC(), d.batchSize); err != nil {
 			return
 		}
 
@@ -165,7 +155,7 @@ func (d *Dispatcher) claimFromQueues(ctx context.Context, pausedMask uint64) ([]
 	all := make([]storage.LeasedJob, 0, cap)
 
 	for _, q := range queues {
-		if pausedMask&(uint64(1)<<queueHash(q)) != 0 {
+		if pausedMask&(uint64(1)<<q.Bit()) != 0 {
 			continue
 		}
 

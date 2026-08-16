@@ -1,10 +1,14 @@
 package parsers
 
 import (
-	"fmt"
+	"errors"
 	"time"
 
 	"github.com/teambition/rrule-go"
+)
+
+var (
+	ErrEmptyPattern = errors.New("empty spec string")
 )
 
 type RRuleSchedule struct {
@@ -24,7 +28,7 @@ func NewRRuleParser() *RRuleParser {
 
 func (p RRuleParser) Parse(pattern string) (Schedule, error) {
 	if len(pattern) == 0 {
-		return nil, fmt.Errorf("empty spec string")
+		return nil, ErrEmptyPattern
 	}
 
 	r, err := rrule.StrToRRule(pattern)

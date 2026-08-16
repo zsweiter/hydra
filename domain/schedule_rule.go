@@ -2,6 +2,8 @@ package domain
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -18,6 +20,31 @@ const (
 	// ScheduleInterval represents a fixed interval schedule.
 	ScheduleInterval ScheduleType = "interval"
 )
+
+// String returns the text representation of the ScheduleType.
+func (t ScheduleType) String() string {
+	return string(t)
+}
+
+// IsValid reports whether the ScheduleType is supported.
+func (t ScheduleType) IsValid() bool {
+	switch t {
+	case ScheduleCron, ScheduleRRule, ScheduleInterval:
+		return true
+	default:
+		return false
+	}
+}
+
+// ParseScheduleType converts a string into a ScheduleType.
+func ParseScheduleType(s string) (ScheduleType, error) {
+	parsed := ScheduleType(strings.ToLower(strings.TrimSpace(s)))
+	if !parsed.IsValid() {
+		return "", fmt.Errorf("unknown schedule type %q", s)
+	}
+
+	return parsed, nil
+}
 
 // ScheduleRule is the public recurrence definition.
 //

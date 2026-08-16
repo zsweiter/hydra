@@ -1,33 +1,126 @@
 package domain
 
-import "time"
+import (
+	"bytes"
+	"database/sql/driver"
+	"fmt"
+	"strings"
+	"time"
+)
 
 type JobStatus uint8
 
 const (
-	StatusPending JobStatus = iota
+	StatusUnknown JobStatus = iota
+	StatusPending
 	StatusProcessing
 	StatusCompleted
 	StatusFailed
-	StatusDeadLetter
+	StatusRetrying   // Job failed and is waiting to be retried
+	StatusScheduled  // Scheduled for future execution by the Recurrence Engine
+	StatusDeadLetter // Max retry attempts reached
+	StatusCancelled  // Manually or systematically cancelled
+	StatusPaused     // Recurrence series paused
 )
 
+var jobStatusNames = [...]string{
+	"unknown",
+	"pending",
+	"processing",
+	"completed",
+	"failed",
+	"retrying",
+	"scheduled",
+	"dead_letter",
+	"cancelled",
+	"paused",
+}
+
+// String returns the text representation of the JobStatus.
 func (s JobStatus) String() string {
-	switch s {
-	case StatusPending:
-		return "pending"
-	case StatusProcessing:
-		return "processing"
-	case StatusCompleted:
-		return "completed"
-	case StatusFailed:
-		return "failed"
-	case StatusDeadLetter:
-		return "dead_letter"
-	default:
+	if int(s) >= len(jobStatusNames) {
 		return "unknown"
 	}
+
+	return jobStatusNames[s]
 }
+
+func (s JobStatus) IsValid() bool {
+	switch s {
+	case StatusPending, StatusProcessing, StatusCompleted, StatusFailed,
+		StatusRetrying, StatusScheduled, StatusDeadLetter, StatusCancelled, StatusPaused:
+		return true
+	default:
+		return false
+	}
+}
+
+// StatusFrom converts a string into a JobStatus.
+func StatusFrom(s string) JobStatus {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "pending":
+		return StatusPending
+	case "processing":
+		return StatusProcessing
+	case "completed":
+		return StatusCompleted
+	case "failed":
+		return StatusFailed
+	case "retrying":
+		return StatusRetrying
+	case "scheduled":
+		return StatusScheduled
+	case "dead_letter":
+		return StatusDeadLetter
+	case "cancelled":
+		return StatusCancelled
+	case "paused":
+		return StatusPaused
+	default:
+		return StatusUnknown
+	}
+}
+
+func (s JobStatus) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + s.String() + `"`), nil
+}
+
+func (s *JobStatus) UnmarshalJSON(data []byte) error {
+	unquoted := bytes.Trim(data, `"`)
+
+	*s = StatusFrom(string(unquoted))
+	if *s == StatusUnknown && !bytes.Equal(data, []byte(`"unknown"`)) {
+		return fmt.Errorf("invalid job status: %q", string(data))
+	}
+
+	return nil
+}
+
+func (s JobStatus) Value() (driver.Value, error) {
+	return s.String(), nil
+}
+
+func (s *JobStatus) Scan(value any) error {
+	if value == nil {
+		*s = StatusUnknown
+		return nil
+	}
+
+	var strVal string
+	switch v := value.(type) {
+	case []byte:
+		strVal = string(v)
+	case string:
+		strVal = v
+	default:
+		return fmt.Errorf("unsupported type for JobStatus scan: %T", value)
+	}
+
+	*s = StatusFrom(strVal)
+	return nil
+}
+
+type JobMetadata map[string]string
 
 // Job represents a single executable unit of work.
 type Job struct {
@@ -52,39 +145,46 @@ type Job struct {
 }
 
 func NewJob(id, name string, data []byte, metadata map[string]string) Job {
+	nowUtc := utcTimeNow()
+
 	return Job{
 		ID:          id,
 		Name:        name,
 		Data:        data,
 		Metadata:    metadata,
-		RunAt:       time.Now().UTC(),
+		RunAt:       nowUtc,
 		Status:      StatusPending,
 		Attempts:    0,
 		MaxAttempts: 3,
 		Backoff:     DefaultBackoff(),
-		CreatedAt:   time.Now().UTC(),
-		UpdatedAt:   time.Now().UTC(),
+		CreatedAt:   nowUtc,
+		UpdatedAt:   nowUtc,
 	}
 }
 
 func (j *Job) AddDelay(delay time.Duration) {
-	j.RunAt = time.Now().Add(delay)
+	j.RunAt = time.Now().UTC().Add(delay)
 }
 
 func (j *Job) UpdateStatus(status JobStatus) {
 	j.Status = status
-	j.UpdatedAt = time.Now().UTC()
+	j.UpdatedAt = utcTimeNow()
 }
 
 func (j *Job) IncrementAttempts() {
 	j.Attempts++
-	j.UpdatedAt = time.Now().UTC()
+	j.UpdatedAt = utcTimeNow()
 }
 
 // IsRetryable reports whether the job
 // can be retried.
 func (j *Job) IsRetryable() bool {
 	return j.Attempts < j.MaxAttempts
+}
+
+// IsDue reports whether the job's RunAt has been reached.
+func (j *Job) IsDue(now time.Time) bool {
+	return !j.RunAt.After(now)
 }
 
 // IsScheduled reports whether the job
@@ -126,3 +226,75 @@ const (
 	BackoffFixed BackoffType = iota
 	BackoffExponential
 )
+
+var backoffTypeNames = [...]string{
+	"fixed",
+	"exponential",
+}
+
+// String returns the text representation of the BackoffType.
+func (b BackoffType) String() string {
+	return enumString(b, backoffTypeNames[:], "unknown")
+}
+
+// IsValid reports whether the BackoffType is defined.
+func (b BackoffType) IsValid() bool {
+	return enumIsValid(b, backoffTypeNames[:])
+}
+
+// MarshalJSON encodes the BackoffType as its text representation.
+func (b BackoffType) MarshalJSON() ([]byte, error) {
+	return enumMarshalJSON(b, backoffTypeNames[:], "unknown")
+}
+
+// UnmarshalJSON decodes a BackoffType from its text representation.
+func (b *BackoffType) UnmarshalJSON(data []byte) error {
+	return enumUnmarshalJSON(b, backoffTypeNames[:], data)
+}
+
+// Value returns the text representation of the BackoffType for persistence.
+func (b BackoffType) Value() (driver.Value, error) {
+	return enumValue(b, backoffTypeNames[:], "unknown")
+}
+
+// Scan reads a BackoffType from its persisted form.
+func (b *BackoffType) Scan(value any) error {
+	return enumScan(b, backoffTypeNames[:], value)
+}
+
+// ParseBackoffType converts a string into a BackoffType.
+func ParseBackoffType(s string) (BackoffType, error) {
+	return enumParse[BackoffType](backoffTypeNames[:], s)
+}
+
+// FailDecision captures the outcome of evaluating the retry
+// policy after a job execution failure.
+type FailDecision struct {
+	// Retry indicates the job should be retried. When false
+	// the job moves to the dead-letter queue.
+	Retry bool
+
+	// NextRunAt is the time the job should run again when
+	// Retry is true.
+	NextRunAt time.Time
+}
+
+// ComputeFailDecision evaluates the retry policy for a failed job.
+//
+// It increments the attempt counter and, when the job is still
+// retryable, computes the next run time from the backoff policy.
+// The caller applies the returned decision through storage.
+func ComputeFailDecision(job *Job, now time.Time) FailDecision {
+	job.Attempts++
+
+	if !job.IsRetryable() {
+		return FailDecision{
+			Retry: false,
+		}
+	}
+
+	return FailDecision{
+		Retry:     true,
+		NextRunAt: now.Add(job.Backoff.NextDelay(job.Attempts)),
+	}
+}

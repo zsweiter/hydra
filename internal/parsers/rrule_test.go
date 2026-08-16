@@ -8,7 +8,7 @@ import (
 func TestRRuleParser_Daily(t *testing.T) {
 	parser := NewRRuleParser()
 
-	schedule, err := parser.Parse("FREQ=DAILY")
+	schedule, err := parser.Parse("FREQ=DAILY;DTSTART=20260602T103000Z")
 	if err != nil {
 		t.Fatalf("Failed to parse rrule expression: %v", err)
 	}
@@ -32,7 +32,7 @@ func TestRRuleParser_Daily(t *testing.T) {
 func TestRRuleParser_Interval(t *testing.T) {
 	parser := NewRRuleParser()
 
-	schedule, err := parser.Parse("FREQ=DAILY;INTERVAL=2")
+	schedule, err := parser.Parse("FREQ=DAILY;INTERVAL=2;DTSTART=20260602T103000Z")
 	if err != nil {
 		t.Fatalf("Failed to parse rrule expression: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestRRuleParser_Interval(t *testing.T) {
 func TestRRuleParser_Weekly(t *testing.T) {
 	parser := NewRRuleParser()
 
-	schedule, err := parser.Parse("FREQ=WEEKLY;BYDAY=MO")
+	schedule, err := parser.Parse("FREQ=WEEKLY;BYDAY=MO;DTSTART=20260602T103000Z")
 	if err != nil {
 		t.Fatalf("Failed to parse rrule expression: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestRRuleParser_Weekly(t *testing.T) {
 func TestRRuleParser_Monthly(t *testing.T) {
 	parser := NewRRuleParser()
 
-	schedule, err := parser.Parse("FREQ=MONTHLY;BYMONTHDAY=15")
+	schedule, err := parser.Parse("FREQ=MONTHLY;BYMONTHDAY=15;DTSTART=20260602T103000Z")
 	if err != nil {
 		t.Fatalf("Failed to parse rrule expression: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestRRuleParser_Monthly(t *testing.T) {
 func TestRRuleParser_Count(t *testing.T) {
 	parser := NewRRuleParser()
 
-	schedule, err := parser.Parse("FREQ=DAILY;COUNT=3")
+	schedule, err := parser.Parse("FREQ=DAILY;COUNT=3;DTSTART=20260603T103000Z")
 	if err != nil {
 		t.Fatalf("Failed to parse rrule expression: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestRRuleParser_Count(t *testing.T) {
 func TestRRuleParser_Until(t *testing.T) {
 	parser := NewRRuleParser()
 
-	schedule, err := parser.Parse("FREQ=DAILY;UNTIL=20260605T103000Z")
+	schedule, err := parser.Parse("FREQ=DAILY;UNTIL=20260605T103000Z;DTSTART=20260602T103000Z")
 	if err != nil {
 		t.Fatalf("Failed to parse rrule expression: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestRRuleParser_Until(t *testing.T) {
 func TestRRuleParser_Hourly(t *testing.T) {
 	parser := NewRRuleParser()
 
-	schedule, err := parser.Parse("FREQ=HOURLY")
+	schedule, err := parser.Parse("FREQ=HOURLY;DTSTART=20260602T103000Z")
 	if err != nil {
 		t.Fatalf("Failed to parse hourly: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestRRuleParser_Hourly(t *testing.T) {
 func TestRRuleParser_Minutely(t *testing.T) {
 	parser := NewRRuleParser()
 
-	schedule, err := parser.Parse("FREQ=MINUTELY;INTERVAL=15")
+	schedule, err := parser.Parse("FREQ=MINUTELY;INTERVAL=15;DTSTART=20260602T103000Z")
 	if err != nil {
 		t.Fatalf("Failed to parse minutely: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestRRuleParser_Minutely(t *testing.T) {
 func TestRRuleParser_Yearly(t *testing.T) {
 	parser := NewRRuleParser()
 
-	schedule, err := parser.Parse("FREQ=YEARLY;BYMONTH=6;BYMONTHDAY=15")
+	schedule, err := parser.Parse("FREQ=YEARLY;BYMONTH=6;BYMONTHDAY=15;DTSTART=20260101T103000Z")
 	if err != nil {
 		t.Fatalf("Failed to parse yearly: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestRRuleParser_Yearly(t *testing.T) {
 func TestRRuleParser_MultipleBYDAY(t *testing.T) {
 	parser := NewRRuleParser()
 
-	schedule, err := parser.Parse("FREQ=WEEKLY;BYDAY=MO,WE,FR")
+	schedule, err := parser.Parse("FREQ=WEEKLY;BYDAY=MO,WE,FR;DTSTART=20260602T103000Z")
 	if err != nil {
 		t.Fatalf("Failed to parse multiple BYDAY: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestRRuleParser_MultipleBYDAY(t *testing.T) {
 func TestRRuleParser_LastDayOfMonth(t *testing.T) {
 	parser := NewRRuleParser()
 
-	schedule, err := parser.Parse("FREQ=MONTHLY;BYMONTHDAY=-1")
+	schedule, err := parser.Parse("FREQ=MONTHLY;BYMONTHDAY=-1;DTSTART=20260115T103000Z")
 	if err != nil {
 		t.Fatalf("Failed to parse last day of month: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestRRuleParser_LastDayOfMonth(t *testing.T) {
 func TestRRuleParser_ByHourMinute(t *testing.T) {
 	parser := NewRRuleParser()
 
-	schedule, err := parser.Parse("FREQ=DAILY;BYHOUR=9,17;BYMINUTE=30")
+	schedule, err := parser.Parse("FREQ=DAILY;BYHOUR=9,17;BYMINUTE=30;DTSTART=20260602T100000Z")
 	if err != nil {
 		t.Fatalf("Failed to parse BYHOUR/BYMINUTE: %v", err)
 	}
@@ -236,7 +236,7 @@ func TestRRuleParser_ByHourMinute(t *testing.T) {
 func TestRRuleParser_MultipleBYMonthDay(t *testing.T) {
 	parser := NewRRuleParser()
 
-	schedule, err := parser.Parse("FREQ=MONTHLY;BYMONTHDAY=1,15,31")
+	schedule, err := parser.Parse("FREQ=MONTHLY;BYMONTHDAY=1,15,31;DTSTART=20260602T103000Z")
 	if err != nil {
 		t.Fatalf("Failed to parse multiple BYMONTHDAY: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestRRuleParser_MultipleBYMonthDay(t *testing.T) {
 func TestRRuleParser_CountZero(t *testing.T) {
 	parser := NewRRuleParser()
 
-	schedule, err := parser.Parse("FREQ=DAILY;COUNT=0")
+	schedule, err := parser.Parse("FREQ=DAILY;COUNT=0;DTSTART=20260602T103000Z")
 	if err != nil {
 		t.Fatalf("Failed to parse COUNT=0: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestRRuleParser_CountZero(t *testing.T) {
 func TestRRuleParser_LargeInterval(t *testing.T) {
 	parser := NewRRuleParser()
 
-	schedule, err := parser.Parse("FREQ=DAILY;INTERVAL=365")
+	schedule, err := parser.Parse("FREQ=DAILY;INTERVAL=365;DTSTART=20260101T103000Z")
 	if err != nil {
 		t.Fatalf("Failed to parse large interval: %v", err)
 	}
@@ -312,7 +312,7 @@ func BenchmarkRRuleParser_Next(b *testing.B) {
 		b.Fatalf("Failed to parse: %v", err)
 	}
 
-	base := time.Now()
+	base := time.Now().UTC()
 	for b.Loop() {
 		schedule.Next(base)
 	}
@@ -335,7 +335,7 @@ func BenchmarkRRuleParser_Complex_Next(b *testing.B) {
 		b.Fatalf("Failed to parse: %v", err)
 	}
 
-	base := time.Now()
+	base := time.Now().UTC()
 	for b.Loop() {
 		schedule.Next(base)
 	}

@@ -35,8 +35,8 @@ func (e *lockedEntropy) Read(p []byte) (int, error) {
 	return e.inner.Read(p)
 }
 
-func New() (ID, error) {
-	ms := ulid.Timestamp(time.Now())
+func NewID() (ID, error) {
+	ms := ulid.Timestamp(time.Now().UTC())
 	id, err := ulid.New(ms, entropy)
 	if err != nil {
 		return ID{}, err
@@ -46,7 +46,7 @@ func New() (ID, error) {
 }
 
 func MustNewID() ID {
-	id, err := New()
+	id, err := NewID()
 	if err != nil {
 		panic(err)
 	}
@@ -54,7 +54,24 @@ func MustNewID() ID {
 	return id
 }
 
-func Parse(s string) (ID, error) {
+func ParseID(s string) (ID, error) {
+	return parseIDString(s)
+}
+
+// parseString accepts both the canonical base32 ULID encoding and the
+// hex encoding produced by ID.String.
+func parseIDString(s string) (ID, error) {
+	if len(s) == hex.EncodedLen(len(ID{})) {
+		raw, err := hex.DecodeString(s)
+		if err != nil {
+			return ID{}, err
+		}
+
+		var u ulid.ULID
+		copy(u[:], raw)
+		return ID(u), nil
+	}
+
 	parsed, err := ulid.Parse(s)
 	if err != nil {
 		return ID{}, err
@@ -63,8 +80,8 @@ func Parse(s string) (ID, error) {
 	return ID(parsed), nil
 }
 
-func MustParse(s string) ID {
-	id, err := Parse(s)
+func MustParseID(s string) ID {
+	id, err := ParseID(s)
 	if err != nil {
 		panic(err)
 	}
@@ -95,7 +112,7 @@ func (id *ID) UnmarshalJSON(b []byte) error {
 		return err
 	}
 
-	parsed, err := ulid.Parse(s)
+	parsed, err := parseIDString(s)
 	if err != nil {
 		return fmt.Errorf("invalid ULID: %w", err)
 	}
@@ -123,19 +140,19 @@ func (id *ID) Scan(value any) error {
 	switch v := value.(type) {
 
 	case string:
-		parsed, err := ulid.Parse(v)
+		parsed, err := parseIDString(v)
 		if err != nil {
 			return fmt.Errorf("failed to parse ULID string: %w", err)
 		}
-		*id = ID(parsed)
+		*id = parsed
 		return nil
 
 	case []byte:
-		parsed, err := ulid.Parse(string(v))
+		parsed, err := parseIDString(string(v))
 		if err != nil {
 			return fmt.Errorf("failed to parse ULID bytes: %w", err)
 		}
-		*id = ID(parsed)
+		*id = parsed
 		return nil
 
 	default:
@@ -148,11 +165,7 @@ func (id ID) Equals(other ID) bool {
 }
 
 func FromString(s string) (ID, error) {
-	parsed, err := ulid.Parse(s)
-	if err != nil {
-		return ID{}, err
-	}
-	return ID(parsed), nil
+	return parseIDString(s)
 }
 
 func FromStringPtr(s *string) *ID {

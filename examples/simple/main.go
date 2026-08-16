@@ -35,7 +35,7 @@ func main() {
 	defer q.Stop(ctx)
 
 	for i := 1; i <= 5; i++ {
-		job := hydra.NewJob("", fmt.Sprintf("email-%d", i), []byte("hello"), nil)
+		job := hydra.NewJob(fmt.Sprintf("email-%d", i), []byte("hello"), nil)
 		if err := q.Submit(ctx, "emails", job); err != nil {
 			log.Fatal(err)
 		}

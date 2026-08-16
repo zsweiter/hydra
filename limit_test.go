@@ -66,7 +66,7 @@ func TestMaxCPULoadDirect(t *testing.T) {
 			var wg sync.WaitGroup
 			done := make(chan struct{})
 
-			start := time.Now()
+			start := time.Now().UTC()
 
 			for g := 0; g < cfg.submitters; g++ {
 				wg.Add(1)
@@ -164,7 +164,7 @@ func TestMaxCPULoadSchedules(t *testing.T) {
 				}
 
 				for i := range n {
-					sch := NewJobSchedule(fmt.Sprintf("limit-sched-%d", i), "limit", []byte("limit"),
+					sch := NewJobScheduleWithID(fmt.Sprintf("limit-sched-%d", i), "limit", []byte("limit"),
 						IntervalRule(interval),
 					)
 					q.UpsertSchedule(ctx, "sched-limit", sch)
@@ -207,10 +207,10 @@ func TestBottleneck(t *testing.T) {
 	}
 
 	t.Run("id-gen", func(t *testing.T) {
-		start := time.Now()
+		start := time.Now().UTC()
 		n := 100000
 		for i := range n {
-			NewJob("", fmt.Sprintf("id-%d", i), nil, nil)
+			NewJob(fmt.Sprintf("id-%d", i), nil, nil)
 		}
 		elapsed := time.Since(start)
 		rate := float64(n) / elapsed.Seconds()
@@ -228,7 +228,7 @@ func TestBottleneck(t *testing.T) {
 		defer cancel()
 		q.Start(ctx)
 
-		start := time.Now()
+		start := time.Now().UTC()
 		n := 100000
 		for i := range n {
 			q.Submit(ctx, "bottleneck", Job{
@@ -254,7 +254,7 @@ func TestBottleneck(t *testing.T) {
 		defer cancel()
 		q.Start(ctx)
 
-		start := time.Now()
+		start := time.Now().UTC()
 		n := 100000
 		for i := range n {
 			q.Submit(ctx, "bottleneck", Job{
@@ -286,7 +286,7 @@ func TestBottleneck(t *testing.T) {
 		})
 		q.Start(ctx)
 
-		start := time.Now()
+		start := time.Now().UTC()
 		n := 50000
 		for i := range n {
 			q.Submit(ctx, "bottleneck", Job{
@@ -339,7 +339,7 @@ func TestMaxSchedulesThroughput(t *testing.T) {
 			expectedMax := float64(n) / interval.Seconds()
 
 			for i := range n {
-				sch := NewJobSchedule(fmt.Sprintf("max-sched-%d", i), "max", []byte("max"),
+				sch := NewJobScheduleWithID(fmt.Sprintf("max-sched-%d", i), "max", []byte("max"),
 					IntervalRule(interval),
 				)
 				q.UpsertSchedule(ctx, "max-sched", sch)

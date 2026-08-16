@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"database/sql/driver"
+	"time"
+)
 
 type ScheduleStatus uint8
 
@@ -10,17 +13,45 @@ const (
 	ScheduleFinished
 )
 
+var scheduleStatusNames = [...]string{
+	"active",
+	"paused",
+	"finished",
+}
+
+// String returns the text representation of the ScheduleStatus.
 func (s ScheduleStatus) String() string {
-	switch s {
-	case ScheduleActive:
-		return "active"
-	case SchedulePaused:
-		return "paused"
-	case ScheduleFinished:
-		return "finished"
-	default:
-		return "unknown"
-	}
+	return enumString(s, scheduleStatusNames[:], "unknown")
+}
+
+// IsValid reports whether the ScheduleStatus is defined.
+func (s ScheduleStatus) IsValid() bool {
+	return enumIsValid(s, scheduleStatusNames[:])
+}
+
+// MarshalJSON encodes the ScheduleStatus as its text representation.
+func (s ScheduleStatus) MarshalJSON() ([]byte, error) {
+	return enumMarshalJSON(s, scheduleStatusNames[:], "unknown")
+}
+
+// UnmarshalJSON decodes a ScheduleStatus from its text representation.
+func (s *ScheduleStatus) UnmarshalJSON(data []byte) error {
+	return enumUnmarshalJSON(s, scheduleStatusNames[:], data)
+}
+
+// Value returns the text representation of the ScheduleStatus for persistence.
+func (s ScheduleStatus) Value() (driver.Value, error) {
+	return enumValue(s, scheduleStatusNames[:], "unknown")
+}
+
+// Scan reads a ScheduleStatus from its persisted form.
+func (s *ScheduleStatus) Scan(value any) error {
+	return enumScan(s, scheduleStatusNames[:], value)
+}
+
+// ParseScheduleStatus converts a string into a ScheduleStatus.
+func ParseScheduleStatus(s string) (ScheduleStatus, error) {
+	return enumParse[ScheduleStatus](scheduleStatusNames[:], s)
 }
 
 // MisfirePolicy defines how the scheduler handles
@@ -42,6 +73,49 @@ const (
 	// the normal schedule.
 	MisfireCatchUp
 )
+
+var misfirePolicyNames = [...]string{
+	"skip",
+	"run_once",
+	"catch_up",
+}
+
+// String returns the text representation of the MisfirePolicy.
+func (m MisfirePolicy) String() string {
+	return enumString(m, misfirePolicyNames[:], "unknown")
+}
+
+// IsValid reports whether the MisfirePolicy is defined.
+func (m MisfirePolicy) IsValid() bool {
+	return enumIsValid(m, misfirePolicyNames[:])
+}
+
+// MarshalJSON encodes the MisfirePolicy as its text representation.
+func (m MisfirePolicy) MarshalJSON() ([]byte, error) {
+	return enumMarshalJSON(m, misfirePolicyNames[:], "unknown")
+}
+
+// UnmarshalJSON decodes a MisfirePolicy from its text representation.
+func (m *MisfirePolicy) UnmarshalJSON(data []byte) error {
+	return enumUnmarshalJSON(m, misfirePolicyNames[:], data)
+}
+
+// Value returns the text representation of the MisfirePolicy for persistence.
+func (m MisfirePolicy) Value() (driver.Value, error) {
+	return enumValue(m, misfirePolicyNames[:], "unknown")
+}
+
+// Scan reads a MisfirePolicy from its persisted form.
+func (m *MisfirePolicy) Scan(value any) error {
+	return enumScan(m, misfirePolicyNames[:], value)
+}
+
+// ParseMisfirePolicy converts a string into a MisfirePolicy.
+func ParseMisfirePolicy(s string) (MisfirePolicy, error) {
+	return enumParse[MisfirePolicy](misfirePolicyNames[:], s)
+}
+
+const UnlimitedJobSchedules = 0
 
 // JobSchedule defines a recurring job template.
 //
@@ -67,7 +141,7 @@ type JobSchedule struct {
 }
 
 func NewJobSchedule(id, name string, payload []byte, rule ScheduleRule) JobSchedule {
-	now := time.Now().UTC()
+	nowUtc := utcTimeNow()
 
 	return JobSchedule{
 		ID:            id,
@@ -79,10 +153,10 @@ func NewJobSchedule(id, name string, payload []byte, rule ScheduleRule) JobSched
 		LastRunAt:     nil,
 		NextRunAt:     nil,
 		Priority:      0,
-		MaxJobs:       0, // 0 = unlimited
+		MaxJobs:       UnlimitedJobSchedules,
 		Rule:          rule,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		CreatedAt:     nowUtc,
+		UpdatedAt:     nowUtc,
 	}
 }
 
@@ -112,8 +186,7 @@ func (s *JobSchedule) ShouldFinish() bool {
 		return true
 	}
 
-	if s.Rule.EndAt != nil &&
-		time.Now().After(*s.Rule.EndAt) {
+	if isExpired(s.Rule.EndAt) {
 		return true
 	}
 
@@ -139,4 +212,14 @@ type CompiledSchedule interface {
 	// The boolean return value is false when
 	// no future occurrence exists.
 	Next(after time.Time) (time.Time, bool)
+}
+
+//go:inline
+func utcTimeNow() time.Time {
+	return time.Now().UTC()
+}
+
+//go:inline
+func isExpired(endAt *time.Time) bool {
+	return endAt != nil && utcTimeNow().After(*endAt)
 }

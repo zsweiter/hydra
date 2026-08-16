@@ -513,7 +513,7 @@ func BenchmarkCronParser_Next(b *testing.B) {
 		b.Fatalf("Failed to parse: %v", err)
 	}
 
-	base := time.Now()
+	base := time.Now().UTC()
 	for b.Loop() {
 		schedule.Next(base)
 	}

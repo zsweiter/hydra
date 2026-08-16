@@ -83,7 +83,6 @@ func (l Level) IsEnabled(level Level) bool {
 }
 
 // create fmt logger that implements Logger interface
-
 func NewDefaultLogger() Logger {
 	return &fmtLogger{
 		level: InfoLevel,

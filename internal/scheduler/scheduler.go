@@ -137,7 +137,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			continue
 		}
 
-		wait := max(time.Duration(next.NextRunNanos-time.Now().UnixNano())*time.Nanosecond, 0)
+		wait := max(time.Duration(next.NextRunNanos-time.Now().UTC().UnixNano())*time.Nanosecond, 0)
 
 		timer := time.NewTimer(wait)
 		select {
@@ -185,7 +185,7 @@ func (s *Scheduler) tick(ctx context.Context) {
 	}
 
 	now := time.Now().UTC()
-	entryTime := time.Unix(0, entry.NextRunNanos)
+	entryTime := time.Unix(0, entry.NextRunNanos).UTC()
 
 	var jobs []*domain.Job
 
@@ -278,7 +278,8 @@ func (s *Scheduler) tick(ctx context.Context) {
 }
 
 func (s *Scheduler) buildJob(entry *HeapEntry, runAt time.Time) *domain.Job {
-	id, _ := domain.New()
+	id, _ := domain.NewID()
+
 	return &domain.Job{
 		ID:         id.String(),
 		Name:       entry.JobName,

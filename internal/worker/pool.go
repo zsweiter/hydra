@@ -167,7 +167,8 @@ func (p *Pool) processJob(job *domain.Job) {
 	defer func() {
 		if r := recover(); r != nil {
 			err := fmt.Errorf("panic in handler: %v", r)
-			p.storage.FailJob(context.Background(), job, err)
+			decision := domain.ComputeFailDecision(job, time.Now().UTC())
+			p.storage.FailJob(context.Background(), job, err, decision)
 		}
 	}()
 
@@ -175,7 +176,8 @@ func (p *Pool) processJob(job *domain.Job) {
 
 	worker := p.registry.Next(job.Queue)
 	if worker == nil {
-		result, _ := p.storage.FailJob(ctx, job, errNoHandler)
+		decision := domain.ComputeFailDecision(job, time.Now().UTC())
+		result, _ := p.storage.FailJob(ctx, job, errNoHandler, decision)
 		if result.Action == storage.FailActionRetry && p.onRetry != nil {
 			p.onRetry(result.NextRunAt)
 		}
@@ -186,7 +188,8 @@ func (p *Pool) processJob(job *domain.Job) {
 	if err == nil {
 		p.storage.AckJob(ctx, job.ID)
 	} else {
-		result, _ := p.storage.FailJob(ctx, job, err)
+		decision := domain.ComputeFailDecision(job, time.Now().UTC())
+		result, _ := p.storage.FailJob(ctx, job, err, decision)
 		if result.Action == storage.FailActionRetry && p.onRetry != nil {
 			p.onRetry(result.NextRunAt)
 		}

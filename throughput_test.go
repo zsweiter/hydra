@@ -100,7 +100,7 @@ func BenchmarkThroughputSchedule(b *testing.B) {
 
 			// Create schedules with very fast interval
 			for i := range s.nSchedules {
-				sch := NewJobSchedule(fmt.Sprintf("tp-sched-%d", i), fmt.Sprintf("tp-%d", i), []byte("tp"),
+				sch := NewJobScheduleWithID(fmt.Sprintf("tp-sched-%d", i), fmt.Sprintf("tp-%d", i), []byte("tp"),
 					IntervalRule(time.Millisecond),
 				)
 				q.UpsertSchedule(ctx, "sched-tp", sch)
@@ -161,7 +161,7 @@ func TestStressReport(t *testing.T) {
 	defer q.Stop(ctx)
 
 	for i := range 5 {
-		sch := NewJobSchedule(fmt.Sprintf("stress-sched-%d", i), "stress", []byte("stress"),
+		sch := NewJobScheduleWithID(fmt.Sprintf("stress-sched-%d", i), "stress", []byte("stress"),
 			IntervalRule(5*time.Millisecond),
 		)
 		q.UpsertSchedule(ctx, "sched", sch)
@@ -170,7 +170,7 @@ func TestStressReport(t *testing.T) {
 	var wg sync.WaitGroup
 	done := make(chan struct{})
 
-	for g := 0; g < 4; g++ {
+	for g := range 4 {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()

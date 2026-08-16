@@ -25,7 +25,6 @@ import (
 const prefix = "hydra:"
 
 func jobKey(id string) string      { return prefix + "job:" + id }
-func leaseKey(id string) string    { return prefix + "lease:" + id }
 func readyKey(q string) string     { return prefix + "q:" + q + ":ready" }
 func scheduleKey(id string) string { return prefix + "schedule:" + id }
 
@@ -64,27 +63,20 @@ func New(opt *Options) *Storage {
 // ──────────────────────────────────────────────
 
 func (s *Storage) SaveJob(ctx context.Context, job *domain.Job) error {
-	now := time.Now()
-	if job.CreatedAt.IsZero() {
-		job.CreatedAt = now
-	}
-
-	job.UpdatedAt = now
-	job.Status = domain.StatusPending
-
 	pipe := s.rdb.Pipeline()
+
 	pipe.HSet(ctx, jobKey(job.ID), map[string]any{
 		"id":              job.ID,
 		"name":            job.Name,
-		"queue":           job.Queue,
+		"queue":           job.Queue.String(),
 		"data":            job.Data,
 		"metadata":        marshalMap(job.Metadata),
 		"run_at":          job.RunAt.UnixMilli(),
 		"priority":        job.Priority,
-		"status":          "pending",
+		"status":          job.Status.String(),
 		"attempts":        job.Attempts,
 		"max_attempts":    job.MaxAttempts,
-		"backoff_type":    int(job.Backoff.Type),
+		"backoff_type":    job.Backoff.Type.String(),
 		"backoff_base_ms": job.Backoff.BaseMs,
 		"backoff_max_ms":  job.Backoff.MaxMs,
 		"schedule_id":     nilStr(job.ScheduleID),
@@ -93,10 +85,10 @@ func (s *Storage) SaveJob(ctx context.Context, job *domain.Job) error {
 		"updated_at":      job.UpdatedAt.UnixMilli(),
 	})
 
-	if job.RunAt.After(now) {
+	if job.Status == domain.StatusScheduled {
 		pipe.ZAdd(ctx, scheduledSet, redis.Z{Score: float64(job.RunAt.UnixMilli()), Member: job.ID})
 	} else {
-		pipe.LPush(ctx, readyKey(job.Queue), job.ID)
+		pipe.LPush(ctx, readyKey(job.Queue.String()), job.ID)
 	}
 
 	_, err := pipe.Exec(ctx)
@@ -107,14 +99,14 @@ func (s *Storage) RemoveJob(ctx context.Context, jobID string) error {
 	jobKey := jobKey(jobID)
 	status, err := s.rdb.HGet(ctx, jobKey, "status").Result()
 	if err == redis.Nil {
-		return fmt.Errorf("job not found: %s", jobID)
+		return fmt.Errorf("%w: %s", storage.ErrNotFound, jobID)
 	}
 	if err != nil {
 		return err
 	}
 
 	if status == "processing" || status == "completed" {
-		return fmt.Errorf("cannot remove processing/completed job: %s", jobID)
+		return fmt.Errorf("%w: job is processing or completed: %s", storage.ErrConflict, jobID)
 	}
 
 	pipe := s.rdb.Pipeline()
@@ -145,11 +137,11 @@ func (s *Storage) ClaimJobs(ctx context.Context, queue domain.QueueName, workerI
 		end
 		return ids
 	`
-	now := time.Now().UnixMilli()
+	now := time.Now().UTC().UnixMilli()
 	expiresMs := int(ttl.Milliseconds())
 	expireSec := int(math.Ceil(ttl.Seconds()))
 
-	ids, err := s.rdb.Eval(ctx, script, []string{readyKey(queue)}, n, now, expiresMs, workerID, expireSec).Result()
+	ids, err := s.rdb.Eval(ctx, script, []string{readyKey(queue.String())}, n, now, expiresMs, workerID, expireSec).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +160,7 @@ func (s *Storage) ClaimJobs(ctx context.Context, queue domain.QueueName, workerI
 		}
 
 		job.Status = domain.StatusProcessing
-		job.UpdatedAt = time.UnixMilli(now)
+		job.UpdatedAt = time.UnixMilli(now).UTC()
 		result[i] = storage.LeasedJob{Job: job}
 	}
 
@@ -182,28 +174,32 @@ func (s *Storage) loadJob(ctx context.Context, id string) (*domain.Job, error) {
 	}
 
 	if len(data) == 0 {
-		return nil, fmt.Errorf("job not found: %s", id)
+		return nil, storage.ErrNotFound
 	}
 
 	job := &domain.Job{
 		ID:             data["id"],
 		Name:           data["name"],
-		Queue:          data["queue"],
+		Queue:          domain.QueueName(data["queue"]),
 		Data:           []byte(data["data"]),
 		Metadata:       unmarshalMap(data["metadata"]),
 		Priority:       int(parseInt(data["priority"])),
-		Status:         parseStatus(data["status"]),
+		Status:         domain.StatusFrom(data["status"]),
 		Attempts:       int(parseInt(data["attempts"])),
 		MaxAttempts:    int(parseInt(data["max_attempts"])),
 		IdempotencyKey: data["idempotency_key"],
 	}
 
-	job.Backoff.Type = domain.BackoffType(parseInt(data["backoff_type"]))
+	backoffType, err := domain.ParseBackoffType(data["backoff_type"])
+	if err != nil {
+		return nil, fmt.Errorf("load job: %w", err)
+	}
+	job.Backoff.Type = backoffType
 	job.Backoff.BaseMs = parseInt(data["backoff_base_ms"])
 	job.Backoff.MaxMs = parseInt(data["backoff_max_ms"])
-	job.RunAt = time.UnixMilli(parseInt(data["run_at"]))
-	job.CreatedAt = time.UnixMilli(parseInt(data["created_at"]))
-	job.UpdatedAt = time.UnixMilli(parseInt(data["updated_at"]))
+	job.RunAt = time.UnixMilli(parseInt(data["run_at"])).UTC()
+	job.CreatedAt = time.UnixMilli(parseInt(data["created_at"])).UTC()
+	job.UpdatedAt = time.UnixMilli(parseInt(data["updated_at"])).UTC()
 
 	if sid := data["schedule_id"]; sid != "" {
 		job.ScheduleID = &sid
@@ -213,17 +209,19 @@ func (s *Storage) loadJob(ctx context.Context, id string) (*domain.Job, error) {
 }
 
 func (s *Storage) AckJob(ctx context.Context, jobID string) error {
-	pipe := s.rdb.Pipeline()
-	pipe.Del(ctx, leaseKey(jobID))
-	pipe.HSet(ctx, jobKey(jobID), "status", "completed", "updated_at", time.Now().UnixMilli())
-
-	_, err := pipe.Exec(ctx)
+	script := `
+		local job_id = KEYS[1]
+		local id_only = string.match(job_id, 'hydra:job:(.+)$')
+		redis.call('DEL', 'hydra:lease:' .. id_only)
+		redis.call('HSET', job_id, 'status', 'completed', 'updated_at', ARGV[1])
+		return 1
+	`
+	_, err := s.rdb.Eval(ctx, script, []string{jobKey(jobID)}, time.Now().UTC().UnixMilli()).Result()
 	return err
 }
 
-func (s *Storage) FailJob(ctx context.Context, job *domain.Job, failErr error) (storage.FailResult, error) {
-	job.Attempts++
-	now := time.Now()
+func (s *Storage) FailJob(ctx context.Context, job *domain.Job, failErr error, decision domain.FailDecision) (*storage.FailResult, error) {
+	now := time.Now().UTC()
 	failedAtStr := now.Format(time.RFC3339)
 
 	script := `
@@ -232,8 +230,7 @@ func (s *Storage) FailJob(ctx context.Context, job *domain.Job, failErr error) (
 		local id_only = string.match(job_id, 'hydra:job:(.+)$')
 		redis.call('DEL', 'hydra:lease:' .. id_only)
 		if retryable == 1 then
-			local delay = tonumber(ARGV[2])
-			local next_run = tonumber(ARGV[3]) + delay
+			local next_run = tonumber(ARGV[2])
 			redis.call('HSET', 'hydra:job:' .. id_only, 'status', 'pending', 'attempts', tonumber(ARGV[4]), 'run_at', next_run, 'updated_at', tonumber(ARGV[3]))
 			redis.call('ZADD', 'hydra:scheduled', next_run, id_only)
 			return {'retry', next_run}
@@ -246,37 +243,32 @@ func (s *Storage) FailJob(ctx context.Context, job *domain.Job, failErr error) (
 	`
 
 	var retryable int
-	var delay int64
-	var nextRun time.Time
-
-	if job.IsRetryable() {
+	var nextRun int64
+	if decision.Retry {
 		retryable = 1
-		delay = job.Backoff.NextDelay(job.Attempts).Milliseconds()
-		nextRun = now.Add(time.Duration(delay) * time.Millisecond)
-	} else {
-		retryable = 0
+		nextRun = decision.NextRunAt.UnixMilli()
 	}
 
 	nowMs := now.UnixMilli()
 
 	result, err := s.rdb.Eval(ctx, script, []string{jobKey(job.ID)},
-		retryable, delay, nowMs, job.Attempts, job.Queue, failErr.Error(), failedAtStr).Result()
+		retryable, nextRun, nowMs, job.Attempts, job.Queue.String(), failErr.Error(), failedAtStr).Result()
 	if err != nil {
-		return storage.FailResult{}, err
+		return nil, err
 	}
 
 	resSlice, ok := result.([]any)
 	if !ok || len(resSlice) < 2 {
-		return storage.FailResult{Action: storage.FailActionDeadLetter}, nil
+		return &storage.FailResult{Action: storage.FailActionDeadLetter}, nil
 	}
 
 	action, _ := resSlice[0].(string)
 	if action == "retry" {
-		job.RunAt = nextRun
-		return storage.FailResult{Action: storage.FailActionRetry, NextRunAt: nextRun}, nil
+		job.RunAt = decision.NextRunAt
+		return &storage.FailResult{Action: storage.FailActionRetry, NextRunAt: decision.NextRunAt}, nil
 	}
 
-	return storage.FailResult{Action: storage.FailActionDeadLetter}, nil
+	return &storage.FailResult{Action: storage.FailActionDeadLetter}, nil
 }
 
 // ──────────────────────────────────────────────
@@ -296,7 +288,7 @@ func (s *Storage) ReadyQueues(ctx context.Context) ([]domain.QueueName, error) {
 		if len > 0 {
 			// Extract queue name from key: hydra:q:{name}:ready
 			q := extractQueueName(key)
-			queues = append(queues, q)
+			queues = append(queues, domain.QueueName(q))
 		}
 	}
 
@@ -373,17 +365,17 @@ func (s *Storage) RecoverOrphaned(ctx context.Context, before time.Time) (int, e
 // ──────────────────────────────────────────────
 
 func (s *Storage) SaveSchedule(ctx context.Context, schedule *domain.JobSchedule) error {
-	now := time.Now().UnixMilli()
+	now := time.Now().UTC().UnixMilli()
 	if schedule.CreatedAt.IsZero() {
-		schedule.CreatedAt = time.UnixMilli(now)
+		schedule.CreatedAt = time.UnixMilli(now).UTC()
 	}
-	schedule.UpdatedAt = time.UnixMilli(now)
+	schedule.UpdatedAt = time.UnixMilli(now).UTC()
 
 	pipe := s.rdb.Pipeline()
 	pipe.HSet(ctx, scheduleKey(schedule.ID), map[string]any{
 		"id":                  schedule.ID,
 		"name":                schedule.Name,
-		"queue":               schedule.Queue,
+		"queue":               schedule.Queue.String(),
 		"data":                schedule.Data,
 		"metadata":            marshalMap(schedule.Metadata),
 		"rule_type":           string(schedule.Rule.Type),
@@ -393,8 +385,8 @@ func (s *Storage) SaveSchedule(ctx context.Context, schedule *domain.JobSchedule
 		"start_at":            optMillis(schedule.Rule.StartAt),
 		"end_at":              optMillis(schedule.Rule.EndAt),
 		"timezone":            schedule.Rule.Timezone,
-		"status":              int(schedule.Status),
-		"misfire_policy":      int(schedule.MisfirePolicy),
+		"status":              schedule.Status.String(),
+		"misfire_policy":      schedule.MisfirePolicy.String(),
 		"last_run_at":         optMillis(schedule.LastRunAt),
 		"next_run_at":         optMillis(schedule.NextRunAt),
 		"priority":            schedule.Priority,
@@ -442,13 +434,13 @@ func (s *Storage) LoadSchedule(ctx context.Context, scheduleID string) (*domain.
 	}
 
 	if len(data) == 0 {
-		return nil, fmt.Errorf("schedule not found: %s", scheduleID)
+		return nil, fmt.Errorf("%w: %s", storage.ErrNotFound, scheduleID)
 	}
 
 	sch := &domain.JobSchedule{
 		ID:            data["id"],
 		Name:          data["name"],
-		Queue:         data["queue"],
+		Queue:         domain.QueueName(data["queue"]),
 		Data:          []byte(data["data"]),
 		Metadata:      unmarshalMap(data["metadata"]),
 		Priority:      int(parseInt(data["priority"])),
@@ -462,28 +454,37 @@ func (s *Storage) LoadSchedule(ctx context.Context, scheduleID string) (*domain.
 		IntervalNanos: parseInt(data["rule_interval_nanos"]),
 		Timezone:      data["timezone"],
 	}
-	sch.Status = domain.ScheduleStatus(int(parseInt(data["status"])))
-	sch.MisfirePolicy = domain.MisfirePolicy(int(parseInt(data["misfire_policy"])))
-	sch.CreatedAt = time.UnixMilli(parseInt(data["created_at"]))
-	sch.UpdatedAt = time.UnixMilli(parseInt(data["updated_at"]))
+	status, err := domain.ParseScheduleStatus(data["status"])
+	if err != nil {
+		return nil, fmt.Errorf("load schedule: %w", err)
+	}
+	sch.Status = status
+
+	misfirePolicy, err := domain.ParseMisfirePolicy(data["misfire_policy"])
+	if err != nil {
+		return nil, fmt.Errorf("load schedule: %w", err)
+	}
+	sch.MisfirePolicy = misfirePolicy
+	sch.CreatedAt = time.UnixMilli(parseInt(data["created_at"])).UTC()
+	sch.UpdatedAt = time.UnixMilli(parseInt(data["updated_at"])).UTC()
 
 	if t := parseInt(data["start_at"]); t > 0 {
-		v := time.UnixMilli(t)
+		v := time.UnixMilli(t).UTC()
 		sch.Rule.StartAt = &v
 	}
 
 	if t := parseInt(data["end_at"]); t > 0 {
-		v := time.UnixMilli(t)
+		v := time.UnixMilli(t).UTC()
 		sch.Rule.EndAt = &v
 	}
 
 	if t := parseInt(data["last_run_at"]); t > 0 {
-		v := time.UnixMilli(t)
+		v := time.UnixMilli(t).UTC()
 		sch.LastRunAt = &v
 	}
 
 	if t := parseInt(data["next_run_at"]); t > 0 {
-		v := time.UnixMilli(t)
+		v := time.UnixMilli(t).UTC()
 		sch.NextRunAt = &v
 	}
 
@@ -491,7 +492,7 @@ func (s *Storage) LoadSchedule(ctx context.Context, scheduleID string) (*domain.
 }
 
 func (s *Storage) UpdateScheduleStatus(ctx context.Context, scheduleID string, status domain.ScheduleStatus) error {
-	_, err := s.rdb.HSet(ctx, scheduleKey(scheduleID), "status", int(status), "updated_at", time.Now().UnixMilli()).Result()
+	_, err := s.rdb.HSet(ctx, scheduleKey(scheduleID), "status", status.String(), "updated_at", time.Now().UTC().UnixMilli()).Result()
 	return err
 }
 
@@ -500,7 +501,7 @@ func (s *Storage) IncrementGeneratedJobs(ctx context.Context, scheduleID string)
 	if err != nil {
 		return 0, err
 	}
-	_, err = s.rdb.HSet(ctx, scheduleKey(scheduleID), "updated_at", time.Now().UnixMilli()).Result()
+	_, err = s.rdb.HSet(ctx, scheduleKey(scheduleID), "updated_at", time.Now().UTC().UnixMilli()).Result()
 	return int(n), err
 }
 
@@ -508,7 +509,7 @@ func (s *Storage) UpdateNextRunAt(ctx context.Context, scheduleID string, nextRu
 	_, err := s.rdb.HSet(ctx, scheduleKey(scheduleID), map[string]any{
 		"last_run_at": lastRun.UnixMilli(),
 		"next_run_at": nextRun.UnixMilli(),
-		"updated_at":  time.Now().UnixMilli(),
+		"updated_at":  time.Now().UTC().UnixMilli(),
 	}).Result()
 
 	return err
@@ -532,7 +533,7 @@ func (s *Storage) ListDLQ(ctx context.Context, queue domain.QueueName) ([]storag
 		}
 		dl := storage.DeadLetter{
 			ID:       data["id"],
-			Queue:    data["queue"],
+			Queue:    domain.QueueName(data["queue"]),
 			Payload:  nil,
 			Error:    data["error"],
 			Attempts: int(parseInt(data["attempts"])),
@@ -551,7 +552,7 @@ func (s *Storage) ListDLQ(ctx context.Context, queue domain.QueueName) ([]storag
 func (s *Storage) RequeueDLQ(ctx context.Context, jobID string) error {
 	exists, err := s.rdb.Exists(ctx, prefix+"dlq:"+jobID).Result()
 	if err != nil || exists == 0 {
-		return fmt.Errorf("dead letter not found: %s", jobID)
+		return fmt.Errorf("%w: %s", storage.ErrNotFound, jobID)
 	}
 
 	data, err := s.rdb.HGetAll(ctx, prefix+"dlq:"+jobID).Result()
@@ -564,7 +565,7 @@ func (s *Storage) RequeueDLQ(ctx context.Context, jobID string) error {
 	pipe := s.rdb.Pipeline()
 	pipe.Del(ctx, prefix+"dlq:"+jobID)
 	pipe.SRem(ctx, prefix+"dlq:index", jobID)
-	now := time.Now().UnixMilli()
+	now := time.Now().UTC().UnixMilli()
 	pipe.HSet(ctx, jobKey(jobID), "status", "pending", "attempts", 0,
 		"run_at", now, "updated_at", now)
 	pipe.LPush(ctx, readyKey(queue), jobID)
@@ -572,6 +573,40 @@ func (s *Storage) RequeueDLQ(ctx context.Context, jobID string) error {
 	_, err = pipe.Exec(ctx)
 
 	return err
+}
+
+func (s *Storage) DrainQueue(ctx context.Context, queue domain.QueueName) (int, error) {
+	script := `
+		local drained = 0
+
+		local ready = redis.call('LRANGE', KEYS[1], 0, -1)
+		if #ready > 0 then
+			for _, id in ipairs(ready) do
+				redis.call('DEL', 'hydra:job:' .. id)
+			end
+			redis.call('DEL', KEYS[1])
+			drained = drained + #ready
+		end
+
+		local scheduled = redis.call('ZRANGE', KEYS[2], 0, -1)
+		for _, id in ipairs(scheduled) do
+			local queue = redis.call('HGET', 'hydra:job:' .. id, 'queue')
+			if queue == ARGV[1] then
+				redis.call('ZREM', KEYS[2], id)
+				redis.call('DEL', 'hydra:job:' .. id)
+				drained = drained + 1
+			end
+		end
+
+		return drained
+	`
+
+	n, err := s.rdb.Eval(ctx, script, []string{readyKey(queue.String()), scheduledSet}, queue.String()).Int()
+	if err != nil {
+		return 0, err
+	}
+
+	return n, nil
 }
 
 // ──────────────────────────────────────────────
@@ -584,7 +619,7 @@ func (s *Storage) NextScheduledAt(ctx context.Context) (time.Time, error) {
 		return time.Time{}, err
 	}
 
-	return time.UnixMilli(int64(entries[0].Score)), nil
+	return time.UnixMilli(int64(entries[0].Score)).UTC(), nil
 }
 
 func (s *Storage) Stats(ctx context.Context) (storage.Stats, error) {
@@ -600,7 +635,7 @@ func (s *Storage) Stats(ctx context.Context) (storage.Stats, error) {
 		}
 		if len > 0 {
 			q := extractQueueName(key)
-			st.ReadyCount[q] = len
+			st.ReadyCount[domain.QueueName(q)] = len
 		}
 	}
 
@@ -655,19 +690,4 @@ func parseInt(s string) int64 {
 	// ignore error — defaults to 0
 	fmt.Sscanf(s, "%d", &v)
 	return v
-}
-
-func parseStatus(s string) domain.JobStatus {
-	switch s {
-	case "processing":
-		return domain.StatusProcessing
-	case "completed":
-		return domain.StatusCompleted
-	case "failed":
-		return domain.StatusFailed
-	case "dead_letter":
-		return domain.StatusDeadLetter
-	default:
-		return domain.StatusPending
-	}
 }

@@ -45,11 +45,14 @@ func (s *Storage) SaveJob(_ context.Context, job *domain.Job) error {
 	if s.ready == nil {
 		s.ready = make(map[domain.QueueName][]*domain.Job)
 	}
-	if job.RunAt.After(time.Now()) {
-		s.insertScheduled(job)
+
+	stored := cloneJob(job)
+	if job.Status == domain.StatusScheduled {
+		s.insertScheduled(stored)
 		return nil
 	}
-	s.ready[job.Queue] = append(s.ready[job.Queue], job)
+
+	s.ready[job.Queue] = append(s.ready[job.Queue], stored)
 	return nil
 }
 
@@ -58,7 +61,7 @@ func (s *Storage) RemoveJob(_ context.Context, jobID string) error {
 	defer s.mu.Unlock()
 
 	if _, leased := s.leases[jobID]; leased {
-		return fmt.Errorf("cannot remove processing job: %s", jobID)
+		return fmt.Errorf("%w: job is processing: %s", storage.ErrConflict, jobID)
 	}
 
 	for queue, jobs := range s.ready {
@@ -80,7 +83,7 @@ func (s *Storage) RemoveJob(_ context.Context, jobID string) error {
 		}
 	}
 
-	return fmt.Errorf("job not found: %s", jobID)
+	return fmt.Errorf("%w: %s", storage.ErrNotFound, jobID)
 }
 
 func (s *Storage) ClaimJobs(_ context.Context, queue domain.QueueName, workerID string, n int, ttl time.Duration) ([]storage.LeasedJob, error) {
@@ -104,16 +107,17 @@ func (s *Storage) ClaimJobs(_ context.Context, queue domain.QueueName, workerID 
 	}
 
 	result := make([]storage.LeasedJob, batch)
-	now := time.Now()
+	now := time.Now().UTC()
 	for i, job := range jobs {
-		job.Status = domain.StatusProcessing
-		job.UpdatedAt = now
+		leased := cloneJob(job)
+		leased.Status = domain.StatusProcessing
+		leased.UpdatedAt = now
 		s.leases[job.ID] = leaseEntry{
-			job:       job,
+			job:       cloneJob(leased),
 			workerID:  workerID,
 			expiresAt: now.Add(ttl),
 		}
-		result[i] = storage.LeasedJob{Job: job}
+		result[i] = storage.LeasedJob{Job: leased}
 	}
 
 	return result, nil
@@ -126,37 +130,37 @@ func (s *Storage) AckJob(_ context.Context, jobID string) error {
 	return nil
 }
 
-func (s *Storage) FailJob(_ context.Context, job *domain.Job, failErr error) (storage.FailResult, error) {
+func (s *Storage) FailJob(_ context.Context, job *domain.Job, failErr error, decision domain.FailDecision) (*storage.FailResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	delete(s.leases, job.ID)
 
-	job.Attempts++
-	job.UpdatedAt = time.Now().UTC()
+	stored := cloneJob(job)
+	stored.UpdatedAt = time.Now().UTC()
 
-	if job.IsRetryable() {
-		delay := job.Backoff.NextDelay(job.Attempts)
-		nextRun := time.Now().Add(delay)
-		job.RunAt = nextRun
-		job.Status = domain.StatusPending
-		s.insertScheduled(job)
-		return storage.FailResult{
+	if decision.Retry {
+		stored.Status = domain.StatusPending
+		stored.RunAt = decision.NextRunAt
+		s.insertScheduled(stored)
+
+		return &storage.FailResult{
 			Action:    storage.FailActionRetry,
-			NextRunAt: nextRun,
+			NextRunAt: decision.NextRunAt,
 		}, nil
 	}
 
-	job.Status = domain.StatusDeadLetter
+	stored.Status = domain.StatusDeadLetter
 	s.dlq = append(s.dlq, storage.DeadLetter{
-		ID:       job.ID,
-		Queue:    job.Queue,
-		Payload:  job.Data,
+		ID:       stored.ID,
+		Queue:    stored.Queue,
+		Payload:  stored.Data,
 		Error:    failErr.Error(),
-		FailedAt: time.Now(),
-		Attempts: job.Attempts,
+		FailedAt: stored.UpdatedAt,
+		Attempts: stored.Attempts,
 	})
-	return storage.FailResult{Action: storage.FailActionDeadLetter}, nil
+
+	return &storage.FailResult{Action: storage.FailActionDeadLetter}, nil
 }
 
 func (s *Storage) PromoteScheduled(_ context.Context, now time.Time, limit int) (int, error) {
@@ -209,8 +213,10 @@ func (s *Storage) RecoverOrphaned(_ context.Context, before time.Time) (int, err
 func (s *Storage) SaveSchedule(_ context.Context, schedule *domain.JobSchedule) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	schedule.UpdatedAt = time.Now().UTC()
-	s.schedules[schedule.ID] = schedule
+
+	stored := cloneSchedule(schedule)
+	stored.UpdatedAt = time.Now().UTC()
+	s.schedules[stored.ID] = stored
 	return nil
 }
 
@@ -228,8 +234,7 @@ func (s *Storage) LoadActiveSchedules(_ context.Context) ([]*domain.JobSchedule,
 	var result []*domain.JobSchedule
 	for _, sch := range s.schedules {
 		if sch.Status == domain.ScheduleActive || sch.Status == domain.SchedulePaused {
-			copy := *sch
-			result = append(result, &copy)
+			result = append(result, cloneSchedule(sch))
 		}
 	}
 	return result, nil
@@ -241,10 +246,9 @@ func (s *Storage) LoadSchedule(_ context.Context, scheduleID string) (*domain.Jo
 
 	sch, ok := s.schedules[scheduleID]
 	if !ok {
-		return nil, fmt.Errorf("schedule not found: %s", scheduleID)
+		return nil, fmt.Errorf("%w: schedule not found: %s", storage.ErrNotFound, scheduleID)
 	}
-	copy := *sch
-	return &copy, nil
+	return cloneSchedule(sch), nil
 }
 
 func (s *Storage) IncrementGeneratedJobs(_ context.Context, scheduleID string) (int, error) {
@@ -253,7 +257,7 @@ func (s *Storage) IncrementGeneratedJobs(_ context.Context, scheduleID string) (
 
 	sch, ok := s.schedules[scheduleID]
 	if !ok {
-		return 0, fmt.Errorf("schedule not found: %s", scheduleID)
+		return 0, fmt.Errorf("%w: schedule not found: %s", storage.ErrNotFound, scheduleID)
 	}
 	sch.GeneratedJobs++
 	sch.UpdatedAt = time.Now().UTC()
@@ -266,7 +270,7 @@ func (s *Storage) UpdateScheduleStatus(_ context.Context, scheduleID string, sta
 
 	sch, ok := s.schedules[scheduleID]
 	if !ok {
-		return fmt.Errorf("schedule not found: %s", scheduleID)
+		return fmt.Errorf("%w: schedule not found: %s", storage.ErrNotFound, scheduleID)
 	}
 	sch.Status = status
 	sch.UpdatedAt = time.Now().UTC()
@@ -279,7 +283,7 @@ func (s *Storage) UpdateNextRunAt(_ context.Context, scheduleID string, nextRun 
 
 	sch, ok := s.schedules[scheduleID]
 	if !ok {
-		return fmt.Errorf("schedule not found: %s", scheduleID)
+		return fmt.Errorf("%w: schedule not found: %s", storage.ErrNotFound, scheduleID)
 	}
 	sch.LastRunAt = &lastRun
 	sch.NextRunAt = &nextRun
@@ -329,7 +333,7 @@ func (s *Storage) RequeueDLQ(_ context.Context, jobID string) error {
 				ID:       dl.ID,
 				Queue:    dl.Queue,
 				Data:     dl.Payload,
-				RunAt:    time.Now(),
+				RunAt:    time.Now().UTC(),
 				Status:   domain.StatusPending,
 				Attempts: 0,
 			}
@@ -337,7 +341,7 @@ func (s *Storage) RequeueDLQ(_ context.Context, jobID string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("dead-letter entry not found: %s", jobID)
+	return fmt.Errorf("%w: dead-letter entry not found: %s", storage.ErrNotFound, jobID)
 }
 
 func (s *Storage) NextScheduledAt(_ context.Context) (time.Time, error) {
@@ -348,6 +352,30 @@ func (s *Storage) NextScheduledAt(_ context.Context) (time.Time, error) {
 		return time.Time{}, nil
 	}
 	return s.scheduled[0].RunAt, nil
+}
+
+func (s *Storage) DrainQueue(_ context.Context, queue domain.QueueName) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	drained := 0
+
+	if ready := s.ready[queue]; len(ready) > 0 {
+		drained += len(ready)
+		delete(s.ready, queue)
+	}
+
+	filtered := s.scheduled[:0]
+	for _, job := range s.scheduled {
+		if job.Queue == queue {
+			drained++
+			continue
+		}
+		filtered = append(filtered, job)
+	}
+	s.scheduled = filtered
+
+	return drained, nil
 }
 
 func (s *Storage) Stats(_ context.Context) (storage.Stats, error) {
@@ -384,4 +412,44 @@ func (s *Storage) insertScheduled(job *domain.Job) {
 	s.scheduled = append(s.scheduled, nil)
 	copy(s.scheduled[idx+1:], s.scheduled[idx:])
 	s.scheduled[idx] = job
+}
+
+func cloneJob(job *domain.Job) *domain.Job {
+	c := *job
+	if job.Data != nil {
+		c.Data = append([]byte(nil), job.Data...)
+	}
+	if job.Metadata != nil {
+		c.Metadata = make(map[string]string, len(job.Metadata))
+		for k, v := range job.Metadata {
+			c.Metadata[k] = v
+		}
+	}
+	if job.ScheduleID != nil {
+		id := *job.ScheduleID
+		c.ScheduleID = &id
+	}
+	return &c
+}
+
+func cloneSchedule(schedule *domain.JobSchedule) *domain.JobSchedule {
+	c := *schedule
+	if schedule.Data != nil {
+		c.Data = append([]byte(nil), schedule.Data...)
+	}
+	if schedule.Metadata != nil {
+		c.Metadata = make(map[string]string, len(schedule.Metadata))
+		for k, v := range schedule.Metadata {
+			c.Metadata[k] = v
+		}
+	}
+	if schedule.LastRunAt != nil {
+		t := *schedule.LastRunAt
+		c.LastRunAt = &t
+	}
+	if schedule.NextRunAt != nil {
+		t := *schedule.NextRunAt
+		c.NextRunAt = &t
+	}
+	return &c
 }

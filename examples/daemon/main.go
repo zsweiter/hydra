@@ -64,7 +64,7 @@ func main() {
 		{"cron-5", "every-hour", "0 * * * *"},
 	}
 	for _, c := range cronExprs {
-		sch := hydra.NewJobSchedule(c.id, c.name, []byte(c.expr),
+		sch := hydra.NewJobScheduleWithID(c.id, c.name, []byte(c.expr),
 			hydra.CronRule(c.expr))
 		sch.ID = c.id
 		if err := q.UpsertSchedule(ctx, "default", sch); err != nil {
@@ -85,7 +85,7 @@ func main() {
 		{"int-5", "every-15s", 15 * time.Second},
 	}
 	for _, iv := range intervals {
-		sch := hydra.NewJobSchedule(iv.id, iv.name, []byte(iv.d.String()),
+		sch := hydra.NewJobScheduleWithID(iv.id, iv.name, []byte(iv.d.String()),
 			hydra.IntervalRule(iv.d))
 		sch.ID = iv.id
 		if err := q.UpsertSchedule(ctx, "default", sch); err != nil {
@@ -106,7 +106,7 @@ func main() {
 		{"rrule-5", "every-1h", "FREQ=HOURLY;INTERVAL=1"},
 	}
 	for _, r := range rruleExprs {
-		sch := hydra.NewJobSchedule(r.id, r.name, []byte(r.expr),
+		sch := hydra.NewJobScheduleWithID(r.id, r.name, []byte(r.expr),
 			hydra.RRuleRule(r.expr))
 		sch.ID = r.id
 		if err := q.UpsertSchedule(ctx, "default", sch); err != nil {
@@ -117,7 +117,7 @@ func main() {
 	// ── 10 direct jobs ──
 	fmt.Println("\n--- Submitting 10 direct jobs ---")
 	for i := 1; i <= 10; i++ {
-		job := hydra.NewJob("", fmt.Sprintf("direct-%d", i), []byte("direct"), nil)
+		job := hydra.NewJob(fmt.Sprintf("direct-%d", i), []byte("direct"), nil)
 		if err := q.Submit(ctx, "default", job); err != nil {
 			fmt.Fprintf(os.Stderr, "direct submit: %v\n", err)
 		}

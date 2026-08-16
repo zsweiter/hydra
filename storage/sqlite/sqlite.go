@@ -8,7 +8,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -46,7 +48,7 @@ func New(path string) (*Storage, error) {
 	}
 	// Append query params
 	sep := "?"
-	if contains(connStr, "?") {
+	if strings.Contains(connStr, "?") {
 		sep = "&"
 	}
 	connStr += sep + "_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"
@@ -82,7 +84,7 @@ func (s *Storage) migrate() error {
 			status TEXT NOT NULL DEFAULT 'pending',
 			attempts INTEGER DEFAULT 0,
 			max_attempts INTEGER DEFAULT 3,
-			backoff_type INTEGER DEFAULT 1,
+			backoff_type TEXT DEFAULT 'exponential',
 			backoff_base_ms INTEGER DEFAULT 100,
 			backoff_max_ms INTEGER DEFAULT 10000,
 			schedule_id TEXT,
@@ -111,8 +113,8 @@ func (s *Storage) migrate() error {
 			start_at INTEGER,
 			end_at INTEGER,
 			timezone TEXT DEFAULT 'UTC',
-			status INTEGER NOT NULL DEFAULT 0,
-			misfire_policy INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'active',
+			misfire_policy TEXT NOT NULL DEFAULT 'skip',
 			last_run_at INTEGER,
 			next_run_at INTEGER,
 			priority INTEGER DEFAULT 0,
@@ -136,21 +138,7 @@ func (s *Storage) migrate() error {
 }
 
 func (s *Storage) SaveJob(ctx context.Context, job *domain.Job) error {
-	now := time.Now()
 	meta := marshalMap(job.Metadata)
-
-	if job.CreatedAt.IsZero() {
-		job.CreatedAt = now
-	}
-
-	job.UpdatedAt = now
-	job.Status = domain.StatusPending
-
-	status := "pending"
-
-	if job.RunAt.After(now) {
-		status = "scheduled"
-	}
 
 	query := `
 		INSERT INTO ha_jobs (
@@ -201,10 +189,10 @@ func (s *Storage) SaveJob(ctx context.Context, job *domain.Job) error {
 		meta,
 		job.RunAt.UnixMilli(),
 		job.Priority,
-		status,
+		job.Status,
 		job.Attempts,
 		job.MaxAttempts,
-		int(job.Backoff.Type),
+		job.Backoff.Type,
 		job.Backoff.BaseMs,
 		job.Backoff.MaxMs,
 		nilStr(job.ScheduleID),
@@ -224,7 +212,7 @@ func (s *Storage) RemoveJob(ctx context.Context, jobID string) error {
 
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("job not found or already processing: %s", jobID)
+		return storage.ErrConflict
 	}
 
 	return nil
@@ -270,7 +258,6 @@ func (s *Storage) ClaimJobs(ctx context.Context, queue domain.QueueName, workerI
 		var runAt int64
 		var createdAt, updatedAt int64
 		var schedID sql.NullString
-		var backoffType int
 		var statusStr string
 		err := rows.Scan(&job.ID,
 			&job.Name,
@@ -282,7 +269,7 @@ func (s *Storage) ClaimJobs(ctx context.Context, queue domain.QueueName, workerI
 			&statusStr,
 			&job.Attempts,
 			&job.MaxAttempts,
-			&backoffType,
+			&job.Backoff.Type,
 			&job.Backoff.BaseMs,
 			&job.Backoff.MaxMs,
 			&schedID,
@@ -296,11 +283,10 @@ func (s *Storage) ClaimJobs(ctx context.Context, queue domain.QueueName, workerI
 			return nil, err
 		}
 
-		job.Status = parseStatus(statusStr)
-		job.Backoff.Type = domain.BackoffType(backoffType)
-		job.RunAt = time.UnixMilli(runAt)
-		job.CreatedAt = time.UnixMilli(createdAt)
-		job.UpdatedAt = time.UnixMilli(updatedAt)
+		job.Status = domain.StatusFrom(statusStr)
+		job.RunAt = time.UnixMilli(runAt).UTC()
+		job.CreatedAt = time.UnixMilli(createdAt).UTC()
+		job.UpdatedAt = time.UnixMilli(updatedAt).UTC()
 		if schedID.Valid {
 			job.ScheduleID = &schedID.String
 		}
@@ -315,7 +301,7 @@ func (s *Storage) ClaimJobs(ctx context.Context, queue domain.QueueName, workerI
 	}
 
 	// Mark as processing and insert leases
-	now := time.Now()
+	now := time.Now().UTC()
 	expires := now.Add(ttl)
 	result := make([]storage.LeasedJob, len(jobs))
 	for i, job := range jobs {
@@ -338,54 +324,67 @@ func (s *Storage) ClaimJobs(ctx context.Context, queue domain.QueueName, workerI
 }
 
 func (s *Storage) AckJob(ctx context.Context, jobID string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM ha_leases WHERE job_id = ?`, jobID)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM ha_leases WHERE job_id = ?`, jobID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ha_jobs SET status = 'completed', updated_at = ? WHERE id = ?`, time.Now().UTC().UnixMilli(), jobID); err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
-// !TODO: considering moving to transaction or atomic operation
-func (s *Storage) FailJob(ctx context.Context, job *domain.Job, failErr error) (storage.FailResult, error) {
-	job.Attempts++
-	job.UpdatedAt = time.Now()
+func (s *Storage) FailJob(ctx context.Context, job *domain.Job, failErr error, decision domain.FailDecision) (*storage.FailResult, error) {
+	job.UpdatedAt = time.Now().UTC()
 
-	if job.Attempts < job.MaxAttempts {
-		delay := job.Backoff.NextDelay(job.Attempts)
-		nextRun := time.Now().Add(delay)
-		job.RunAt = nextRun
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM ha_leases WHERE job_id = ?`, job.ID); err != nil {
+		return nil, err
+	}
+
+	if decision.Retry {
 		job.Status = domain.StatusPending
+		job.RunAt = decision.NextRunAt
 
-		_, err := s.db.ExecContext(ctx, `DELETE FROM ha_leases WHERE job_id = ?`, job.ID)
-		if err != nil {
-			return storage.FailResult{}, err
+		query := `UPDATE ha_jobs SET status = ?, attempts = ?, run_at = ?, updated_at = ? WHERE id = ?`
+		if _, err := tx.ExecContext(ctx, query, "pending", job.Attempts, decision.NextRunAt.UnixMilli(), job.UpdatedAt.UnixMilli(), job.ID); err != nil {
+			return nil, err
 		}
 
-		query := `UPDATE ha_jobs SET status = ?, attempts = ?, run_at = ?,updated_at = ? WHERE id = ?`
-		_, err = s.db.ExecContext(ctx, query, "pending", job.Attempts, nextRun.UnixMilli(), job.UpdatedAt.UnixMilli(), job.ID)
-		if err != nil {
-			return storage.FailResult{}, err
+		if err := tx.Commit(); err != nil {
+			return nil, err
 		}
 
-		return storage.FailResult{Action: storage.FailActionRetry, NextRunAt: nextRun}, nil
+		return &storage.FailResult{Action: storage.FailActionRetry, NextRunAt: decision.NextRunAt}, nil
 	}
 
 	job.Status = domain.StatusDeadLetter
-	_, err := s.db.ExecContext(ctx, `DELETE FROM ha_leases WHERE job_id = ?`, job.ID)
-	if err != nil {
-		return storage.FailResult{}, err
+	if _, err := tx.ExecContext(ctx, `UPDATE ha_jobs SET status = ?, attempts = ?, updated_at = ? WHERE id = ?`,
+		"dead_letter", job.Attempts, job.UpdatedAt.UnixMilli(), job.ID); err != nil {
+		return nil, err
 	}
 
-	_, err = s.db.ExecContext(ctx, `UPDATE ha_jobs SET status = ?, attempts = ?, updated_at = ? WHERE id = ?`,
-		"dead_letter", job.Attempts, job.UpdatedAt.UnixMilli(), job.ID)
-	if err != nil {
-		return storage.FailResult{}, err
+	if _, err := tx.ExecContext(ctx, `INSERT INTO ha_dead_letters(id, queue, payload, error, failed_at, attempts) VALUES(?,?,?,?,?,?)`,
+		job.ID, job.Queue, job.Data, failErr.Error(), job.UpdatedAt.UnixMilli(), job.Attempts); err != nil {
+		return nil, err
 	}
 
-	_, err = s.db.ExecContext(ctx, `INSERT INTO ha_dead_letters(id, queue, payload, error, failed_at, attempts) VALUES(?,?,?,?,?,?)`,
-		job.ID, job.Queue, job.Data, failErr.Error(), time.Now().UnixMilli(), job.Attempts)
-	if err != nil {
-		return storage.FailResult{}, err
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 
-	return storage.FailResult{Action: storage.FailActionDeadLetter}, nil
+	return &storage.FailResult{Action: storage.FailActionDeadLetter}, nil
 }
 
 // ──────────────────────────────────────────────
@@ -393,7 +392,7 @@ func (s *Storage) FailJob(ctx context.Context, job *domain.Job, failErr error) (
 // ──────────────────────────────────────────────
 
 func (s *Storage) ReadyQueues(ctx context.Context) ([]domain.QueueName, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT queue FROM ha_jobs WHERE status = 'pending' AND run_at <= ?`, time.Now().UnixMilli())
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT queue FROM ha_jobs WHERE status = 'pending' AND run_at <= ?`, time.Now().UTC().UnixMilli())
 	if err != nil {
 		return nil, err
 	}
@@ -471,12 +470,12 @@ func (s *Storage) RecoverOrphaned(ctx context.Context, before time.Time) (int, e
 
 func (s *Storage) SaveSchedule(ctx context.Context, schedule *domain.JobSchedule) error {
 	meta := marshalMap(schedule.Metadata)
-	now := time.Now().UnixMilli()
+	now := time.Now().UTC().UnixMilli()
 	if schedule.CreatedAt.IsZero() {
-		schedule.CreatedAt = time.UnixMilli(now)
+		schedule.CreatedAt = time.UnixMilli(now).UTC()
 	}
 
-	schedule.UpdatedAt = time.UnixMilli(now)
+	schedule.UpdatedAt = time.UnixMilli(now).UTC()
 
 	query := `INSERT INTO ha_schedules(id,
 		name,
@@ -537,8 +536,8 @@ func (s *Storage) SaveSchedule(ctx context.Context, schedule *domain.JobSchedule
 		optMillis(schedule.Rule.StartAt),
 		optMillis(schedule.Rule.EndAt),
 		schedule.Rule.Timezone,
-		int(schedule.Status),
-		int(schedule.MisfirePolicy),
+		schedule.Status,
+		schedule.MisfirePolicy,
 		optMillis(schedule.LastRunAt),
 		optMillis(schedule.NextRunAt),
 		schedule.Priority,
@@ -578,7 +577,7 @@ func (s *Storage) LoadActiveSchedules(ctx context.Context) ([]*domain.JobSchedul
 		generated_jobs,
 		created_at,
 		updated_at 
-	FROM ha_schedules WHERE status IN (0,1)`)
+	FROM ha_schedules WHERE status IN ('active','paused')`)
 
 	if err != nil {
 		return nil, err
@@ -591,36 +590,33 @@ func (s *Storage) LoadActiveSchedules(ctx context.Context) ([]*domain.JobSchedul
 		sch := &domain.JobSchedule{}
 		var meta string
 		var startAt, endAt, lastRun, nextRun sql.NullInt64
-		var statusInt, misfireInt int
 		var createdAtMillis, updatedAtMillis int64
 		if err := rows.Scan(&sch.ID, &sch.Name, &sch.Queue, &sch.Data, &meta,
 			&sch.Rule.Type, &sch.Rule.Expression, &sch.Rule.IntervalMs, &sch.Rule.IntervalNanos,
 			&startAt, &endAt, &sch.Rule.Timezone,
-			&statusInt, &misfireInt,
+			&sch.Status, &sch.MisfirePolicy,
 			&lastRun, &nextRun,
 			&sch.Priority, &sch.MaxJobs, &sch.GeneratedJobs,
 			&createdAtMillis, &updatedAtMillis); err != nil {
 			return nil, err
 		}
 		sch.Metadata = unmarshalMap(meta)
-		sch.Status = domain.ScheduleStatus(statusInt)
-		sch.MisfirePolicy = domain.MisfirePolicy(misfireInt)
-		sch.CreatedAt = time.UnixMilli(createdAtMillis)
-		sch.UpdatedAt = time.UnixMilli(updatedAtMillis)
+		sch.CreatedAt = time.UnixMilli(createdAtMillis).UTC()
+		sch.UpdatedAt = time.UnixMilli(updatedAtMillis).UTC()
 		if startAt.Valid {
-			t := time.UnixMilli(startAt.Int64)
+			t := time.UnixMilli(startAt.Int64).UTC()
 			sch.Rule.StartAt = &t
 		}
 		if endAt.Valid {
-			t := time.UnixMilli(endAt.Int64)
+			t := time.UnixMilli(endAt.Int64).UTC()
 			sch.Rule.EndAt = &t
 		}
 		if lastRun.Valid {
-			t := time.UnixMilli(lastRun.Int64)
+			t := time.UnixMilli(lastRun.Int64).UTC()
 			sch.LastRunAt = &t
 		}
 		if nextRun.Valid {
-			t := time.UnixMilli(nextRun.Int64)
+			t := time.UnixMilli(nextRun.Int64).UTC()
 			sch.NextRunAt = &t
 		}
 		result = append(result, sch)
@@ -633,7 +629,6 @@ func (s *Storage) LoadSchedule(ctx context.Context, scheduleID string) (*domain.
 	sch := &domain.JobSchedule{}
 	var meta string
 	var startAt, endAt, lastRun, nextRun sql.NullInt64
-	var statusInt, misfireInt int
 	var createdAtMillis, updatedAtMillis int64
 
 	row := s.db.QueryRowContext(ctx,
@@ -666,37 +661,38 @@ func (s *Storage) LoadSchedule(ctx context.Context, scheduleID string) (*domain.
 		&sch.ID, &sch.Name, &sch.Queue, &sch.Data, &meta,
 		&sch.Rule.Type, &sch.Rule.Expression, &sch.Rule.IntervalMs, &sch.Rule.IntervalNanos,
 		&startAt, &endAt, &sch.Rule.Timezone,
-		&statusInt, &misfireInt,
+		&sch.Status, &sch.MisfirePolicy,
 		&lastRun, &nextRun,
 		&sch.Priority, &sch.MaxJobs, &sch.GeneratedJobs,
 		&createdAtMillis, &updatedAtMillis)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: %s", storage.ErrNotFound, scheduleID)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("load schedule: %w", err)
 	}
 
 	sch.Metadata = unmarshalMap(meta)
-	sch.Status = domain.ScheduleStatus(statusInt)
-	sch.MisfirePolicy = domain.MisfirePolicy(misfireInt)
-	sch.CreatedAt = time.UnixMilli(createdAtMillis)
-	sch.UpdatedAt = time.UnixMilli(updatedAtMillis)
+	sch.CreatedAt = time.UnixMilli(createdAtMillis).UTC()
+	sch.UpdatedAt = time.UnixMilli(updatedAtMillis).UTC()
 
 	if startAt.Valid {
-		t := time.UnixMilli(startAt.Int64)
+		t := time.UnixMilli(startAt.Int64).UTC()
 		sch.Rule.StartAt = &t
 	}
 
 	if endAt.Valid {
-		t := time.UnixMilli(endAt.Int64)
+		t := time.UnixMilli(endAt.Int64).UTC()
 		sch.Rule.EndAt = &t
 	}
 
 	if lastRun.Valid {
-		t := time.UnixMilli(lastRun.Int64)
+		t := time.UnixMilli(lastRun.Int64).UTC()
 		sch.LastRunAt = &t
 	}
 
 	if nextRun.Valid {
-		t := time.UnixMilli(nextRun.Int64)
+		t := time.UnixMilli(nextRun.Int64).UTC()
 		sch.NextRunAt = &t
 	}
 
@@ -704,13 +700,13 @@ func (s *Storage) LoadSchedule(ctx context.Context, scheduleID string) (*domain.
 }
 
 func (s *Storage) UpdateScheduleStatus(ctx context.Context, scheduleID string, status domain.ScheduleStatus) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE ha_schedules SET status = ?,updated_at = ? WHERE id = ?`, int(status), time.Now().UnixMilli(), scheduleID)
+	_, err := s.db.ExecContext(ctx, `UPDATE ha_schedules SET status = ?,updated_at = ? WHERE id = ?`, status, time.Now().UTC().UnixMilli(), scheduleID)
 	return err
 }
 
 func (s *Storage) IncrementGeneratedJobs(ctx context.Context, scheduleID string) (int, error) {
 	var gen int
-	err := s.db.QueryRowContext(ctx, `UPDATE ha_schedules SET generated_jobs = generated_jobs + 1, updated_at = ? WHERE id = ? RETURNING generated_jobs`, time.Now().UnixMilli(), scheduleID).Scan(&gen)
+	err := s.db.QueryRowContext(ctx, `UPDATE ha_schedules SET generated_jobs = generated_jobs + 1, updated_at = ? WHERE id = ? RETURNING generated_jobs`, time.Now().UTC().UnixMilli(), scheduleID).Scan(&gen)
 	if err != nil {
 		return 0, err
 	}
@@ -719,7 +715,7 @@ func (s *Storage) IncrementGeneratedJobs(ctx context.Context, scheduleID string)
 }
 
 func (s *Storage) UpdateNextRunAt(ctx context.Context, scheduleID string, nextRun time.Time, lastRun time.Time) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE ha_schedules SET last_run_at = ?, next_run_at = ?, updated_at = ? WHERE id = ?`, lastRun.UnixMilli(), nextRun.UnixMilli(), time.Now().UnixMilli(), scheduleID)
+	_, err := s.db.ExecContext(ctx, `UPDATE ha_schedules SET last_run_at = ?, next_run_at = ?, updated_at = ? WHERE id = ?`, lastRun.UnixMilli(), nextRun.UnixMilli(), time.Now().UTC().UnixMilli(), scheduleID)
 	return err
 }
 
@@ -749,7 +745,7 @@ func (s *Storage) ListDLQ(ctx context.Context, queue domain.QueueName) ([]storag
 		if err := rows.Scan(&dl.ID, &dl.Queue, &dl.Payload, &dl.Error, &failedAt, &dl.Attempts); err != nil {
 			return nil, err
 		}
-		dl.FailedAt = time.UnixMilli(failedAt)
+		dl.FailedAt = time.UnixMilli(failedAt).UTC()
 		result = append(result, dl)
 	}
 
@@ -767,15 +763,18 @@ func (s *Storage) RequeueDLQ(ctx context.Context, jobID string) error {
 	var dl storage.DeadLetter
 	var failedAt int64
 	err = tx.QueryRowContext(ctx, `SELECT id, queue, payload, error, failed_at, attempts FROM ha_dead_letters WHERE id = ?`, jobID).Scan(&dl.ID, &dl.Queue, &dl.Payload, &dl.Error, &failedAt, &dl.Attempts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: %s", storage.ErrNotFound, jobID)
+	}
 	if err != nil {
-		return fmt.Errorf("dead letter not found: %w", err)
+		return err
 	}
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM ha_dead_letters WHERE id=?`, jobID); err != nil {
 		return err
 	}
 
-	now := time.Now()
+	now := time.Now().UTC()
 	// Job may still exist in ha_jobs table (as dead_letter status).
 	// Update it back to pending.
 	if _, err := tx.ExecContext(ctx, `UPDATE ha_jobs SET status = 'pending',attempts = 0, run_at = ?, updated_at = ? WHERE id = ?`,
@@ -801,14 +800,24 @@ func (s *Storage) NextScheduledAt(ctx context.Context) (time.Time, error) {
 		return time.Time{}, err
 	}
 
-	return time.UnixMilli(runAt), nil
+	return time.UnixMilli(runAt).UTC(), nil
+}
+
+func (s *Storage) DrainQueue(ctx context.Context, queue domain.QueueName) (int, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM ha_jobs WHERE queue = ? AND status IN ('pending', 'scheduled')`, queue.String())
+	if err != nil {
+		return 0, err
+	}
+
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 func (s *Storage) Stats(ctx context.Context) (storage.Stats, error) {
 	var st storage.Stats
 	st.ReadyCount = make(map[domain.QueueName]int64)
 
-	rows, err := s.db.QueryContext(ctx, `SELECT queue, COUNT(*) FROM ha_jobs WHERE status = 'pending' AND run_at <= ? GROUP BY queue`, time.Now().UnixMilli())
+	rows, err := s.db.QueryContext(ctx, `SELECT queue, COUNT(*) FROM ha_jobs WHERE status = 'pending' AND run_at <= ? GROUP BY queue`, time.Now().UTC().UnixMilli())
 	if err != nil {
 		return st, err
 	}
@@ -839,16 +848,6 @@ func (s *Storage) Close() error {
 //  Helpers
 // ──────────────────────────────────────────────
 
-func contains(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-
-	return false
-}
-
 func marshalMap(m map[string]string) string {
 	b, _ := json.Marshal(m)
 	return string(b)
@@ -861,7 +860,7 @@ func unmarshalMap(s string) map[string]string {
 	return m
 }
 
-func nilStr(s *string) interface{} {
+func nilStr(s *string) any {
 	if s == nil {
 		return nil
 	}
@@ -869,25 +868,10 @@ func nilStr(s *string) interface{} {
 	return *s
 }
 
-func optMillis(t *time.Time) interface{} {
+func optMillis(t *time.Time) any {
 	if t == nil {
 		return nil
 	}
 
 	return t.UnixMilli()
-}
-
-func parseStatus(s string) domain.JobStatus {
-	switch s {
-	case "processing":
-		return domain.StatusProcessing
-	case "completed":
-		return domain.StatusCompleted
-	case "failed":
-		return domain.StatusFailed
-	case "dead_letter":
-		return domain.StatusDeadLetter
-	default:
-		return domain.StatusPending
-	}
 }

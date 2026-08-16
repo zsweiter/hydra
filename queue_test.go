@@ -2,10 +2,13 @@ package hydra
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/zsweiter/hydra/storage"
 )
 
 func TestSubmitAndProcessJob(t *testing.T) {
@@ -123,7 +126,7 @@ func TestScheduleInterval(t *testing.T) {
 	}
 	defer q.Stop(ctx)
 
-	schedule := NewJobSchedule("", "every-100ms", []byte("tick"),
+	schedule := NewJobSchedule("every-100ms", []byte("tick"),
 		IntervalRule(100*time.Millisecond),
 	)
 
@@ -161,7 +164,7 @@ func TestPauseResumeSchedule(t *testing.T) {
 	}
 	defer q.Stop(ctx)
 
-	schedule := NewJobSchedule("sched-1", "every-50ms", []byte("tick"),
+	schedule := NewJobScheduleWithID("sched-1", "every-50ms", []byte("tick"),
 		IntervalRule(50*time.Millisecond),
 	)
 
@@ -279,7 +282,7 @@ func TestRemoveSchedule(t *testing.T) {
 	}
 	defer q.Stop(ctx)
 
-	schedule := NewJobSchedule("rm-sched", "every-50ms", []byte("tick"),
+	schedule := NewJobScheduleWithID("rm-sched", "every-50ms", []byte("tick"),
 		IntervalRule(50*time.Millisecond),
 	)
 
@@ -379,6 +382,172 @@ func TestStats(t *testing.T) {
 	if stats.ActiveWorkers == 0 {
 		t.Fatal("expected active workers")
 	}
+}
+
+func TestDrain(t *testing.T) {
+	q := New(Config{
+		MinWorkers: 1,
+		MaxWorkers: 2,
+		BatchSize:  10,
+		LeaseTTL:   time.Minute,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	q.Handle("drain-queue", func(ctx context.Context, job *Job) error { return nil })
+
+	if err := q.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer q.Stop(ctx)
+
+	// Ready jobs on a paused queue stay pending.
+	if err := q.Pause(ctx, "drain-paused"); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if err := q.Submit(ctx, "drain-paused", Job{Name: "job"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Scheduled jobs are pending as well.
+	future := time.Now().UTC().Add(10 * time.Minute)
+	for range 2 {
+		if err := q.Submit(ctx, "drain-queue", Job{Name: "job", RunAt: future}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := q.Drain(ctx, "drain-paused"); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Drain(ctx, "drain-queue"); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := q.storage.Stats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := st.ReadyCount["drain-paused"]; n != 0 {
+		t.Fatalf("expected drain-paused to be drained, got %d ready jobs", n)
+	}
+	if n := st.ReadyCount["drain-queue"]; n != 0 {
+		t.Fatalf("expected drain-queue to be drained, got %d ready jobs", n)
+	}
+	if n := st.ScheduledCount; n != 0 {
+		t.Fatalf("expected scheduled jobs to be drained, got %d", n)
+	}
+}
+
+func TestRetryJob(t *testing.T) {
+	q := New(Config{
+		MinWorkers: 1,
+		MaxWorkers: 2,
+		BatchSize:  10,
+		LeaseTTL:   100 * time.Millisecond,
+		MaxRetries: 1,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var attempts atomic.Int32
+
+	q.Handle("retry-queue", func(ctx context.Context, job *Job) error {
+		attempts.Add(1)
+		return assertErr{} // always fails
+	})
+
+	if err := q.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer q.Stop(ctx)
+
+	jobID := "retry-job-1"
+	if err := q.Submit(ctx, "retry-queue", Job{
+		ID:   jobID,
+		Name: "fail",
+		Backoff: BackoffPolicy{
+			Type:   BackoffFixed,
+			BaseMs: 10,
+			MaxMs:  10,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForDLQ(t, ctx, q.storage, "retry-queue")
+
+	if err := q.RetryJob(ctx, "retry-queue", jobID); err != nil {
+		t.Fatal(err)
+	}
+
+	before := attempts.Load()
+	waitFor(t, ctx, func() bool { return attempts.Load() > before })
+
+	if err := q.RetryJob(ctx, "retry-queue", "does-not-exist"); err == nil {
+		t.Fatal("expected error retrying a job that is not in the DLQ")
+	}
+}
+
+func TestSentinelErrors(t *testing.T) {
+	q := New(Config{})
+
+	if err := q.Submit(context.Background(), "q", Job{Name: "x"}); !errors.Is(err, ErrQueueNotRunning) {
+		t.Fatalf("expected ErrQueueNotRunning, got %v", err)
+	}
+	if err := q.Drain(context.Background(), "q"); !errors.Is(err, ErrQueueNotRunning) {
+		t.Fatalf("expected ErrQueueNotRunning, got %v", err)
+	}
+	if err := q.RetryJob(context.Background(), "q", "id"); !errors.Is(err, ErrQueueNotRunning) {
+		t.Fatalf("expected ErrQueueNotRunning, got %v", err)
+	}
+	if err := q.Stop(context.Background()); !errors.Is(err, ErrQueueNotRunning) {
+		t.Fatalf("expected ErrQueueNotRunning, got %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := q.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := q.Start(ctx); !errors.Is(err, ErrQueueAlreadyRunning) {
+		t.Fatalf("expected ErrQueueAlreadyRunning, got %v", err)
+	}
+
+	if err := q.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForDLQ(t *testing.T, ctx context.Context, s storage.Storage, queue QueueName) {
+	t.Helper()
+	waitFor(t, ctx, func() bool {
+		dls, err := s.ListDLQ(ctx, queue)
+		return err == nil && len(dls) > 0
+	})
+}
+
+func waitFor(t *testing.T, ctx context.Context, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for condition: %v", ctx.Err())
+		default:
+		}
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for condition")
 }
 
 type assertErr struct{}

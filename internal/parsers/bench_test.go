@@ -25,7 +25,7 @@ func BenchmarkCronNext(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	base := time.Now()
+	base := time.Now().UTC()
 	for b.Loop() {
 		sched.Next(base)
 	}
@@ -81,7 +81,7 @@ func BenchmarkRRuleDailyNext(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	base := time.Now()
+	base := time.Now().UTC()
 	for b.Loop() {
 		sched.Next(base)
 	}
@@ -103,7 +103,7 @@ func BenchmarkRRuleComplexNext(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	base := time.Now()
+	base := time.Now().UTC()
 	for b.Loop() {
 		sched.Next(base)
 	}
@@ -139,7 +139,7 @@ func BenchmarkScheduleParserCronNext(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	base := time.Now()
+	base := time.Now().UTC()
 	for b.Loop() {
 		sched.Next(base)
 	}
@@ -151,7 +151,7 @@ func BenchmarkScheduleParserRRuleNext(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	base := time.Now()
+	base := time.Now().UTC()
 	for b.Loop() {
 		sched.Next(base)
 	}

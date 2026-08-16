@@ -2,9 +2,39 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/zsweiter/hydra/domain"
+)
+
+var (
+	// ErrNotFound indicates that the requested entity does not exist.
+	ErrNotFound = errors.New("storage: not found")
+
+	// ErrAlreadyExists indicates that an entity with the same identity
+	// already exists in storage.
+	ErrAlreadyExists = errors.New("storage: already exists")
+
+	// ErrConflict indicates that the requested operation conflicts with
+	// the current state of the stored entity.
+	ErrConflict = errors.New("storage: conflict")
+
+	// ErrInvalid indicates that the requested operation contains invalid
+	// or unsupported data.
+	ErrInvalid = errors.New("storage: invalid")
+
+	// ErrClosed indicates that the storage is no longer available for
+	// read or write operations.
+	ErrClosed = errors.New("storage: closed")
+
+	// ErrTimeout indicates that the storage operation could not complete
+	// within the allowed time.
+	ErrTimeout = errors.New("storage: timeout")
+
+	// ErrUnavailable indicates that the storage backend is temporarily
+	// unavailable.
+	ErrUnavailable = errors.New("storage: unavailable")
 )
 
 // LeasedJob represents a job that has been claimed
@@ -55,9 +85,13 @@ type Stats struct {
 //
 // Implementations must be safe for concurrent use.
 type Storage interface {
-	// SaveJob persists a job. If RunAt <= now the job
-	// is immediately available for claiming; otherwise
-	// it is scheduled for future promotion.
+	// SaveJob persists a job.
+	//
+	// The caller decides the job's delivery status and sets it on the
+	// job (see domain.Job.IsDue): StatusScheduled jobs are held for
+	// later promotion by PromoteScheduled, while any other status is
+	// placed in the ready queue and persisted verbatim. A status other
+	// than StatusPending or StatusScheduled is not claimable.
 	SaveJob(ctx context.Context, job *domain.Job) error
 
 	// RemoveJob deletes a pending or scheduled job by ID.
@@ -76,10 +110,11 @@ type Storage interface {
 
 	// FailJob handles a job execution failure.
 	//
-	// If the job is retryable, it calculates the backoff
-	// delay and reschedules the job. If max attempts have
-	// been exceeded, the job moves to the dead-letter queue.
-	FailJob(ctx context.Context, job *domain.Job, failErr error) (FailResult, error)
+	// The retry or dead-letter outcome is described by decision,
+	// which the caller computes from the domain retry policy (see
+	// domain.ComputeFailDecision). Storage only persists the result,
+	// atomically where the backend allows it.
+	FailJob(ctx context.Context, job *domain.Job, failErr error, decision domain.FailDecision) (*FailResult, error)
 
 	// ReadyQueues returns a list of queue names that have
 	// at least one ready (pending) job.
@@ -130,6 +165,13 @@ type Storage interface {
 	// RequeueDLQ moves a dead-letter entry back to the
 	// ready queue for reprocessing.
 	RequeueDLQ(ctx context.Context, jobID string) error
+
+	// DrainQueue removes all pending and scheduled jobs from the
+	// specified queue. Jobs that are currently being processed are
+	// not interrupted.
+	//
+	// Returns the number of jobs removed.
+	DrainQueue(ctx context.Context, queue domain.QueueName) (int, error)
 
 	// NextScheduledAt returns the RunAt of the earliest
 	// due scheduled job. Returns zero time if no scheduled

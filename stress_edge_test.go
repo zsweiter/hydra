@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/zsweiter/hydra/domain"
 )
 
 // ──────────────────────────────────────────────
@@ -135,7 +137,7 @@ func TestJobScheduledFarFuture(t *testing.T) {
 	q.Start(ctx)
 	defer q.Stop(ctx)
 
-	future := time.Now().Add(10 * time.Minute)
+	future := time.Now().UTC().Add(10 * time.Minute)
 	err := q.Submit(ctx, "future", Job{
 		Name:  "future-job",
 		Data:  []byte("not yet"),
@@ -169,7 +171,7 @@ func TestScheduleWithMaxJobs(t *testing.T) {
 	q.Start(ctx)
 	defer q.Stop(ctx)
 
-	schedule := NewJobSchedule("limited-sched", "max-3-jobs", []byte("limited"),
+	schedule := NewJobScheduleWithID("limited-sched", "max-3-jobs", []byte("limited"),
 		IntervalRule(50*time.Millisecond),
 	)
 	schedule.MaxJobs = 3
@@ -205,7 +207,7 @@ func TestScheduleCatchUpMisfire(t *testing.T) {
 	q.Start(ctx)
 	defer q.Stop(ctx)
 
-	schedule := NewJobSchedule("catch-sched", "catchup-test", []byte("catch"),
+	schedule := NewJobScheduleWithID("catch-sched", "catchup-test", []byte("catch"),
 		IntervalRule(30*time.Millisecond),
 	)
 	schedule.MisfirePolicy = MisfireCatchUp
@@ -299,7 +301,7 @@ func TestUpsertRemoveRace(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			id := fmt.Sprintf("race-sched-%d", i)
-			schedule := NewJobSchedule(id, fmt.Sprintf("race-%d", i), []byte("race"),
+			schedule := NewJobScheduleWithID(id, fmt.Sprintf("race-%d", i), []byte("race"),
 				IntervalRule(50*time.Millisecond),
 			)
 			q.UpsertSchedule(ctx, "race-q", schedule)
@@ -354,8 +356,8 @@ func TestConcurrentJobSubmission(t *testing.T) {
 	wg.Wait()
 
 	// Wait for processing to finish
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
+	deadline := time.Now().UTC().Add(5 * time.Second)
+	for time.Now().UTC().Before(deadline) {
 		if processed.Load() >= int32(N) {
 			break
 		}
@@ -397,8 +399,8 @@ func TestManyJobsSingleQueue(t *testing.T) {
 		})
 	}
 
-	deadline := time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadline) {
+	deadline := time.Now().UTC().Add(8 * time.Second)
+	for time.Now().UTC().Before(deadline) {
 		if processed.Load() >= int32(N) {
 			break
 		}
@@ -430,7 +432,7 @@ func TestManyQueuesConcurrent(t *testing.T) {
 	for i := range nQueues {
 		qName := fmt.Sprintf("mq-%d", i)
 		idx := i
-		q.Handle(qName, func(ctx context.Context, job *Job) error {
+		q.Handle(domain.QueueName(qName), func(ctx context.Context, job *Job) error {
 			counts[idx].Add(1)
 			return nil
 		})
@@ -439,10 +441,10 @@ func TestManyQueuesConcurrent(t *testing.T) {
 	q.Start(ctx)
 	defer q.Stop(ctx)
 
-	for i := 0; i < nQueues; i++ {
+	for i := range nQueues {
 		qName := fmt.Sprintf("mq-%d", i)
 		for j := 0; j < nJobs; j++ {
-			q.Submit(ctx, qName, Job{
+			q.Submit(ctx, domain.QueueName(qName), Job{
 				Name: fmt.Sprintf("job-%d-%d", i, j),
 				Data: []byte("data"),
 			})
@@ -450,7 +452,7 @@ func TestManyQueuesConcurrent(t *testing.T) {
 	}
 	// Submit all jobs for this queue, then move on
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().UTC().Add(5 * time.Second)
 	totalProcessed := func() int {
 		sum := 0
 		for i := range nQueues {
@@ -459,7 +461,7 @@ func TestManyQueuesConcurrent(t *testing.T) {
 		return sum
 	}
 
-	for time.Now().Before(deadline) {
+	for time.Now().UTC().Before(deadline) {
 		if totalProcessed() >= nQueues*nJobs {
 			break
 		}
@@ -496,7 +498,7 @@ func TestConcurrentScheduleOps(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			id := fmt.Sprintf("sched-op-%d", i)
-			schedule := NewJobSchedule(id, fmt.Sprintf("op-%d", i), []byte("op"),
+			schedule := NewJobScheduleWithID(id, fmt.Sprintf("op-%d", i), []byte("op"),
 				IntervalRule(time.Duration(10+(i%10))*time.Millisecond),
 			)
 			_ = q.UpsertSchedule(ctx, "sched-op", schedule)
@@ -643,7 +645,7 @@ func BenchmarkScheduleGeneration(b *testing.B) {
 	b.ResetTimer()
 
 	// Use a very fast interval to generate many jobs quickly
-	schedule := NewJobSchedule("bench-sched", "bench-gen", []byte("gen"),
+	schedule := NewJobScheduleWithID("bench-sched", "bench-gen", []byte("gen"),
 		IntervalRule(time.Millisecond),
 	)
 	q.UpsertSchedule(ctx, "sbench", schedule)

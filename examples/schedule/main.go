@@ -42,7 +42,7 @@ func main() {
 	defer q.Stop(ctx)
 
 	// Interval schedule
-	intervalSched := hydra.NewJobSchedule("", "heartbeat", []byte("ping"),
+	intervalSched := hydra.NewJobSchedule("heartbeat", []byte("ping"),
 		hydra.IntervalRule(200*time.Millisecond),
 	)
 	if err := q.UpsertSchedule(ctx, "ticker", intervalSched); err != nil {
@@ -51,7 +51,7 @@ func main() {
 	fmt.Println("Interval schedule created (every 200ms)")
 
 	// RRULE schedule (every minute for demo)
-	rruleSched := hydra.NewJobSchedule("", "weekly-report", []byte("report"),
+	rruleSched := hydra.NewJobSchedule("weekly-report", []byte("report"),
 		hydra.RRuleRule("FREQ=SECONDLY;INTERVAL=1"),
 	)
 	rruleSched.MisfirePolicy = hydra.MisfireSkip
