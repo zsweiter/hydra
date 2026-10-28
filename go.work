@@ -1,8 +1,22 @@
-go 1.26.1
+go 1.27.3
 
 use (
 	.
+	./broker/nats
+	./cmd/hydra-scheduler
+	./contract/cetest
 	./examples
-	./storage/sqlite
+	./storage/postgres
 	./storage/redis
+	./storage/sqlite
 )
+
+replace github.com/zsweiter/hydra v0.2.0 => ./
+
+replace github.com/zsweiter/hydra/broker/nats v0.2.0 => ./broker/nats
+
+replace github.com/zsweiter/hydra/storage/sqlite v0.2.0 => ./storage/sqlite
+
+replace github.com/zsweiter/hydra/storage/redis v0.2.0 => ./storage/redis
+
+replace github.com/zsweiter/hydra/storage/postgres v0.2.0 => ./storage/postgres

@@ -29,6 +29,11 @@ func (s JobStatus) String() string {
 	}
 }
 
+// MetadataScheduledFor is the job metadata key holding the
+// RFC 3339 time a schedule-generated job was due. Unlike
+// RunAt, it does not move when the job is retried.
+const MetadataScheduledFor = "hydra.scheduled_for"
+
 // Job represents a single executable unit of work.
 type Job struct {
 	ID          string

@@ -8,6 +8,15 @@ const (
 	ScheduleActive ScheduleStatus = iota
 	SchedulePaused
 	ScheduleFinished
+
+	// ScheduleCancelled is a tombstone: the schedule was
+	// removed, but the record and its Version are kept so an
+	// older definition arriving late cannot revive it.
+	ScheduleCancelled
+
+	// ScheduleArchived is a past revision of a schedule that
+	// was replaced, kept as history under its own ID.
+	ScheduleArchived
 )
 
 func (s ScheduleStatus) String() string {
@@ -18,6 +27,10 @@ func (s ScheduleStatus) String() string {
 		return "paused"
 	case ScheduleFinished:
 		return "finished"
+	case ScheduleCancelled:
+		return "cancelled"
+	case ScheduleArchived:
+		return "archived"
 	default:
 		return "unknown"
 	}
@@ -62,8 +75,17 @@ type JobSchedule struct {
 	Priority      int
 	MaxJobs       int
 	GeneratedJobs int
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+
+	// Version orders concurrent writes of the same schedule,
+	// e.g. a broker sequence number. When non-zero, saving a
+	// schedule whose Version is not greater than the stored
+	// one is rejected, so an out-of-order update or a
+	// redelivery cannot overwrite newer state. Zero disables
+	// the check.
+	Version int64
+
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 func NewJobSchedule(id, name string, payload []byte, rule ScheduleRule) JobSchedule {
@@ -104,7 +126,7 @@ func (s *JobSchedule) SetTimezone(tz string) *JobSchedule {
 // IsFinished reports whether the schedule
 // can generate additional jobs.
 func (s *JobSchedule) ShouldFinish() bool {
-	if s.Status == ScheduleFinished {
+	if s.Status == ScheduleFinished || s.Status == ScheduleCancelled || s.Status == ScheduleArchived {
 		return true
 	}
 

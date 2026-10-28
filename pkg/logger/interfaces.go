@@ -91,52 +91,80 @@ func NewDefaultLogger() Logger {
 }
 
 type fmtLogger struct {
-	level Level
+	level  Level
+	fields Fields
+}
+
+// merge prepends the fields set with With.
+func (l *fmtLogger) merge(fields []Fields) []Fields {
+	if len(l.fields) == 0 {
+		return fields
+	}
+
+	return append([]Fields{l.fields}, fields...)
 }
 
 func (l *fmtLogger) Debug(msg string, fields ...Fields) {
 	if l.level.IsEnabled(DebugLevel) {
-		fmt.Printf("[DEBUG] %s %v\n", msg, fields)
+		fmt.Printf("[DEBUG] %s %v\n", msg, l.merge(fields))
 	}
 }
 
 func (l *fmtLogger) Info(msg string, fields ...Fields) {
 	if l.level.IsEnabled(InfoLevel) {
-		fmt.Printf("[INFO] %s %v\n", msg, fields)
+		fmt.Printf("[INFO] %s %v\n", msg, l.merge(fields))
 	}
 }
 
 func (l *fmtLogger) Warn(msg string, fields ...Fields) {
 	if l.level.IsEnabled(WarnLevel) {
-		fmt.Printf("[WARN] %s %v\n", msg, fields)
+		fmt.Printf("[WARN] %s %v\n", msg, l.merge(fields))
 	}
 }
 
 func (l *fmtLogger) Error(err error, fields ...Fields) {
 	if l.level.IsEnabled(ErrorLevel) {
-		fmt.Printf("[ERROR] %s: %v %v\n", err.Error(), err, fields)
+		fmt.Printf("[ERROR] %s %v\n", err.Error(), l.merge(fields))
 	}
 }
 
 func (l *fmtLogger) Fatal(err error, fields ...Fields) {
 	if l.level.IsEnabled(FatalLevel) {
-		fmt.Printf("[FATAL] %s: %v %v\n", err.Error(), err, fields)
+		fmt.Printf("[FATAL] %s %v\n", err.Error(), l.merge(fields))
 		os.Exit(1)
 	}
 }
 
 func (l *fmtLogger) With(fields Fields) Logger {
-	return &fmtLogger{
-		level: l.level,
+	merged := make(Fields, len(l.fields)+len(fields))
+	for k, v := range l.fields {
+		merged[k] = v
 	}
+
+	for k, v := range fields {
+		merged[k] = v
+	}
+
+	return &fmtLogger{level: l.level, fields: merged}
 }
 
 func (l *fmtLogger) WithContext(ctx context.Context) Logger {
-	return &fmtLogger{
-		level: l.level,
-	}
+	return l
 }
 
 var DefaultLogger Logger = NewDefaultLogger()
 
 var _ Logger = (*fmtLogger)(nil)
+
+// Nop returns a logger that discards everything.
+func Nop() Logger { return nopLogger{} }
+
+type nopLogger struct{}
+
+func (nopLogger) Debug(string, ...Fields)              {}
+func (nopLogger) Info(string, ...Fields)               {}
+func (nopLogger) Warn(string, ...Fields)               {}
+func (nopLogger) Error(error, ...Fields)               {}
+func (nopLogger) Fatal(err error, _ ...Fields)         { os.Exit(1) }
+func (n nopLogger) With(Fields) Logger                 { return n }
+func (n nopLogger) WithContext(context.Context) Logger { return n }

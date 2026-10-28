@@ -36,7 +36,15 @@ type Pool struct {
 	onRetry          func(nextRunAt time.Time)
 	stopChan         chan struct{}
 	wg               sync.WaitGroup
+
+	// acks feeds the acker, which acknowledges completed jobs
+	// in batches.
+	acks      chan string
+	ackerDone chan struct{}
 }
+
+// ackBatch caps how many jobs one AckJobs call acknowledges.
+const ackBatch = 256
 
 // Config holds configuration for the worker pool.
 type Config struct {
@@ -88,23 +96,56 @@ func NewPool(registry *Registry, s storage.Storage, cfg Config) *Pool {
 		bufCap:           chanSize,
 		onRetry:          cfg.OnRetry,
 		stopChan:         make(chan struct{}),
+		acks:             make(chan string, ackBatch*4),
+		ackerDone:        make(chan struct{}),
 	}
 }
 
 // Start launches the pool's permanent workers.
 func (p *Pool) Start(_ context.Context) error {
+	go p.runAcker()
 	for i := 0; i < p.minWorkers; i++ {
-		p.spawnWorker(false)
+		p.spawnWorker(true)
 	}
 
 	return nil
 }
 
-// Stop gracefully shuts down the pool.
+// Stop gracefully shuts down the pool, once the jobs already
+// processed are acknowledged.
 func (p *Pool) Stop(_ context.Context) error {
 	close(p.stopChan)
 	p.wg.Wait()
+	close(p.acks)
+	<-p.ackerDone
 	return nil
+}
+
+// runAcker acknowledges completed jobs. It takes every ack
+// waiting, up to ackBatch, per AckJobs call: one at a time
+// when idle, so a lone job is not delayed, and in batches
+// under load, so acks cost a fraction of a round trip each.
+// A failed ack leaves the lease to expire; the job is then
+// processed again (at least once).
+func (p *Pool) runAcker() {
+	defer close(p.ackerDone)
+	batch := make([]string, 0, ackBatch)
+	for id := range p.acks {
+		batch = append(batch[:0], id)
+	drain:
+		for len(batch) < ackBatch {
+			select {
+			case id, ok := <-p.acks:
+				if !ok {
+					break drain
+				}
+				batch = append(batch, id)
+			default:
+				break drain
+			}
+		}
+		p.storage.AckJobs(context.Background(), batch)
+	}
 }
 
 // JobChan returns the channel where the Dispatcher sends jobs.
@@ -182,14 +223,44 @@ func (p *Pool) processJob(job *domain.Job) {
 		return
 	}
 
+	stopHeartbeat := p.heartbeat(job.ID)
 	err := worker(ctx, job)
+	stopHeartbeat()
+
 	if err == nil {
-		p.storage.AckJob(ctx, job.ID)
+		p.acks <- job.ID
 	} else {
 		result, _ := p.storage.FailJob(ctx, job, err)
 		if result.Action == storage.FailActionRetry && p.onRetry != nil {
 			p.onRetry(result.NextRunAt)
 		}
+	}
+}
+
+// heartbeat extends the lease of a running job every third of
+// LeaseTTL, so a job that outlives the TTL is not recovered as
+// an orphan and run twice. The returned func stops it.
+func (p *Pool) heartbeat(jobID string) func() {
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(p.leaseTTL / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				p.storage.ExtendLease(context.Background(), jobID, p.leaseTTL)
+			}
+		}
+	}()
+
+	return func() {
+		close(done)
+		<-stopped
 	}
 }
 

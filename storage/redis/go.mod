@@ -1,10 +1,10 @@
 module github.com/zsweiter/hydra/storage/redis
 
-go 1.26.1
+go 1.27.3
 
 require (
 	github.com/redis/go-redis/v9 v9.7.1
-	github.com/zsweiter/hydra v0.1.3
+	github.com/zsweiter/hydra v0.2.0
 )
 
 require (

@@ -310,7 +310,7 @@ func (p CronParser) Parse(pattern string) (Schedule, error) {
 		var err error
 		i := strings.Index(pattern, " ")
 		eq := strings.Index(pattern, "=")
-		if loc, err = time.LoadLocation(pattern[eq+1 : i]); err != nil {
+		if loc, err = LoadLocation(pattern[eq+1 : i]); err != nil {
 			return nil, fmt.Errorf("provided bad location %s: %v", pattern[eq+1:i], err)
 		}
 		pattern = strings.TrimSpace(pattern[i:])

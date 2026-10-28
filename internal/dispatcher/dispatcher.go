@@ -9,22 +9,11 @@ import (
 	"github.com/zsweiter/hydra/storage"
 )
 
-// queueHash computes a 6-bit hash (0-63) from a queue name
-// for use in the paused-queues bitmask.
-func queueHash(name domain.QueueName) uint64 {
-	var h uint64
-	for i := 0; i < len(name); i++ {
-		h = h*31 + uint64(name[i])
-	}
-	return h & 63
-}
-
 // Dispatcher claims jobs from storage and feeds them into
 // the worker pool's job channel.
 //
 // It batches claims to reduce storage round trips and
-// respects queue pause states via a bitmask for up to 64
-// queues.
+// skips paused queues.
 type Dispatcher struct {
 	storage   storage.Storage
 	jobChan   chan<- *domain.Job
@@ -32,7 +21,7 @@ type Dispatcher struct {
 	batchSize int
 	leaseTTL  time.Duration
 	workerID  string
-	paused    atomic.Uint64
+	paused    atomic.Pointer[map[domain.QueueName]struct{}]
 	stopped   atomic.Bool
 }
 
@@ -48,7 +37,7 @@ func New(s storage.Storage, jobChan chan<- *domain.Job, batchSize int, leaseTTL 
 		signal:    make(chan struct{}, 1),
 		batchSize: batchSize,
 		leaseTTL:  leaseTTL,
-		workerID:  "dispatcher-" + time.Now().Format("150405"),
+		workerID:  "dispatcher-" + newID(),
 	}
 }
 
@@ -69,18 +58,25 @@ func (d *Dispatcher) Signal() {
 	}
 }
 
-// PauseQueue prevents the Dispatcher from claiming jobs for
-// a specific queue. Queue names are hashed; collisions result
-// in both queues being paused (safe, max 64 queues).
-func (d *Dispatcher) PauseQueue(queue domain.QueueName) {
-	mask := uint64(1) << queueHash(queue)
-	d.paused.Or(mask)
+// SetPausedQueues replaces the set of queues the Dispatcher
+// must not claim jobs from.
+func (d *Dispatcher) SetPausedQueues(queues []domain.QueueName) {
+	set := make(map[domain.QueueName]struct{}, len(queues))
+	for _, q := range queues {
+		set[q] = struct{}{}
+	}
+
+	d.paused.Store(&set)
 }
 
-// ResumeQueue re-enables job claiming for a specific queue.
-func (d *Dispatcher) ResumeQueue(queue domain.QueueName) {
-	mask := ^(uint64(1) << queueHash(queue))
-	d.paused.And(mask)
+func (d *Dispatcher) isPaused(queue domain.QueueName) bool {
+	set := d.paused.Load()
+	if set == nil {
+		return false
+	}
+
+	_, ok := (*set)[queue]
+	return ok
 }
 
 // Run starts the dispatcher loop. Blocks until the context
@@ -118,8 +114,6 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 }
 
 func (d *Dispatcher) drain(ctx context.Context) {
-	pausedMask := d.paused.Load()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -131,7 +125,7 @@ func (d *Dispatcher) drain(ctx context.Context) {
 			return
 		}
 
-		claimed, err := d.claimFromQueues(ctx, pausedMask)
+		claimed, err := d.claimFromQueues(ctx)
 		if err != nil {
 			return
 		}
@@ -154,7 +148,7 @@ func (d *Dispatcher) drain(ctx context.Context) {
 	}
 }
 
-func (d *Dispatcher) claimFromQueues(ctx context.Context, pausedMask uint64) ([]storage.LeasedJob, error) {
+func (d *Dispatcher) claimFromQueues(ctx context.Context) ([]storage.LeasedJob, error) {
 	queues, err := d.storage.ReadyQueues(ctx)
 	if err != nil {
 		return nil, err
@@ -165,7 +159,7 @@ func (d *Dispatcher) claimFromQueues(ctx context.Context, pausedMask uint64) ([]
 	all := make([]storage.LeasedJob, 0, cap)
 
 	for _, q := range queues {
-		if pausedMask&(uint64(1)<<queueHash(q)) != 0 {
+		if d.isPaused(q) {
 			continue
 		}
 
@@ -183,4 +177,15 @@ func (d *Dispatcher) claimFromQueues(ctx context.Context, pausedMask uint64) ([]
 	}
 
 	return all, nil
+}
+
+// newID makes lease owners unique across instances; a
+// timestamp alone collides when two start in the same second.
+func newID() string {
+	id, err := domain.New()
+	if err != nil {
+		return time.Now().Format("150405.000000000")
+	}
+
+	return id.String()
 }

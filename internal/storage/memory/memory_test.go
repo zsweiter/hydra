@@ -56,7 +56,7 @@ func TestAckJob(t *testing.T) {
 	s.SaveJob(ctx, job)
 
 	leased, _ := s.ClaimJobs(ctx, "emails", "w1", 10, time.Minute)
-	if err := s.AckJob(ctx, leased[0].Job.ID); err != nil {
+	if err := s.AckJobs(ctx, []string{leased[0].Job.ID}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -180,7 +180,7 @@ func TestSaveAndLoadSchedule(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	schedules, err := s.LoadActiveSchedules(ctx)
+	schedules, err := s.LoadSchedules(ctx, []string{"sched-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func TestDeleteSchedule(t *testing.T) {
 	s.SaveSchedule(ctx, sch)
 	s.DeleteSchedule(ctx, "sched-1")
 
-	schedules, _ := s.LoadActiveSchedules(ctx)
+	schedules, _ := s.LoadSchedules(ctx, []string{"sched-1"})
 	if len(schedules) != 0 {
 		t.Fatalf("expected 0 schedules after delete")
 	}

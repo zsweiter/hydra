@@ -2,6 +2,7 @@ package parsers
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/teambition/rrule-go"
@@ -33,4 +34,19 @@ func (p RRuleParser) Parse(pattern string) (Schedule, error) {
 	}
 
 	return RRuleSchedule{rrule: r}, nil
+}
+
+// HasDTStart reports whether an RRULE expression carries
+// its own DTSTART anchor.
+func HasDTStart(pattern string) bool {
+	return strings.Contains(strings.ToUpper(pattern), "DTSTART")
+}
+
+// WithDTStart anchors the rule at dt. Without an anchor,
+// rrule-go uses the parse time, which moves on every restart
+// and shifts INTERVAL>1 rules.
+func (s RRuleSchedule) WithDTStart(dt time.Time) RRuleSchedule {
+	r := *s.rrule
+	r.DTStart(dt)
+	return RRuleSchedule{rrule: &r}
 }

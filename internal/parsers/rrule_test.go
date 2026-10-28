@@ -5,48 +5,35 @@ import (
 	"time"
 )
 
-func TestRRuleParser_Daily(t *testing.T) {
-	parser := NewRRuleParser()
-
-	schedule, err := parser.Parse("FREQ=DAILY")
+// parseAnchored parses expr with DTSTART set to dtstart.
+// Without an anchor, rrule-go uses the parse time and tests
+// with fixed base dates break as the calendar moves on.
+func parseAnchored(t *testing.T, expr string, dtstart time.Time) Schedule {
+	t.Helper()
+	schedule, err := NewRRuleParser().Parse(expr)
 	if err != nil {
 		t.Fatalf("Failed to parse rrule expression: %v", err)
 	}
+	return schedule.(RRuleSchedule).WithDTStart(dtstart)
+}
 
+func TestRRuleParser_Daily(t *testing.T) {
 	base := time.Date(2026, 6, 2, 10, 30, 0, 0, time.UTC)
+	schedule := parseAnchored(t, "FREQ=DAILY", base.Add(-24*time.Hour))
+
 	next := schedule.Next(base)
-
-	if next.Before(base) {
-		t.Error("Expected next time to be after base time")
-	}
-
-	// RRULE occurrences are relative to DTSTART (set at parse time),
-	// so the exact diff depends on when this test runs.
-	// Just verify it returns a reasonable future time.
-	diff := next.Sub(base)
-	if diff < time.Hour || diff > 720*time.Hour {
-		t.Errorf("Expected reasonable future time, got %v", diff)
+	if want := base.Add(24 * time.Hour); !next.Equal(want) {
+		t.Errorf("Expected %v, got %v", want, next)
 	}
 }
 
 func TestRRuleParser_Interval(t *testing.T) {
-	parser := NewRRuleParser()
-
-	schedule, err := parser.Parse("FREQ=DAILY;INTERVAL=2")
-	if err != nil {
-		t.Fatalf("Failed to parse rrule expression: %v", err)
-	}
-
 	base := time.Date(2026, 6, 2, 10, 30, 0, 0, time.UTC)
+	schedule := parseAnchored(t, "FREQ=DAILY;INTERVAL=2", base)
+
 	next := schedule.Next(base)
-
-	if next.Before(base) {
-		t.Error("Expected next time to be after base time")
-	}
-
-	diff := next.Sub(base)
-	if diff < 24*time.Hour || diff > 72*time.Hour {
-		t.Errorf("Expected ~48 hours difference, got %v", diff)
+	if want := base.Add(48 * time.Hour); !next.Equal(want) {
+		t.Errorf("Expected %v, got %v", want, next)
 	}
 }
 
@@ -114,18 +101,17 @@ func TestRRuleParser_Count(t *testing.T) {
 }
 
 func TestRRuleParser_Until(t *testing.T) {
-	parser := NewRRuleParser()
+	base := time.Date(2026, 6, 2, 10, 30, 0, 0, time.UTC)
+	schedule := parseAnchored(t, "FREQ=DAILY;UNTIL=20260605T103000Z", base)
 
-	schedule, err := parser.Parse("FREQ=DAILY;UNTIL=20260605T103000Z")
-	if err != nil {
-		t.Fatalf("Failed to parse rrule expression: %v", err)
+	next := schedule.Next(base)
+	if want := base.Add(24 * time.Hour); !next.Equal(want) {
+		t.Errorf("Expected %v, got %v", want, next)
 	}
 
-	base := time.Date(2026, 6, 2, 10, 30, 0, 0, time.UTC)
-	next := schedule.Next(base)
-
-	if next.Before(base) {
-		t.Error("Expected next time to be after base time")
+	until := time.Date(2026, 6, 5, 10, 30, 0, 0, time.UTC)
+	if after := schedule.Next(until); !after.IsZero() {
+		t.Errorf("Expected no occurrence after UNTIL, got %v", after)
 	}
 }
 
@@ -234,14 +220,9 @@ func TestRRuleParser_ByHourMinute(t *testing.T) {
 }
 
 func TestRRuleParser_MultipleBYMonthDay(t *testing.T) {
-	parser := NewRRuleParser()
-
-	schedule, err := parser.Parse("FREQ=MONTHLY;BYMONTHDAY=1,15,31")
-	if err != nil {
-		t.Fatalf("Failed to parse multiple BYMONTHDAY: %v", err)
-	}
-
 	base := time.Date(2026, 6, 2, 10, 30, 0, 0, time.UTC)
+	schedule := parseAnchored(t, "FREQ=MONTHLY;BYMONTHDAY=1,15,31", base.Add(-24*time.Hour))
+
 	next := schedule.Next(base)
 
 	if next.Day() != 15 {

@@ -1,0 +1,165 @@
+# Publishes hydra-scheduler when a version tag is pushed:
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# - Images (linux/amd64 + linux/arm64), one per store, on the
+#   GitHub Container Registry:
+#     ghcr.io/<owner>/hydra-scheduler:0.2.0-sqlite   :sqlite
+#     ghcr.io/<owner>/hydra-scheduler:0.2.0-redis    :redis     (Valkey, Dragonfly)
+#     ghcr.io/<owner>/hydra-scheduler:0.2.0-postgres :postgres
+# - Static binaries for every store and architecture, attached to
+#   the GitHub release of the tag, with SHA-256 checksums.
+#
+# The CI workflow (ci.yml) runs first; nothing is published
+# unless it passes. Pull requests run CI alone.
+#
+# The first push creates the package as private. Make it public
+# once in the package settings (Package settings → Change
+# visibility); later pushes keep that visibility.
+name: release
+
+on:
+    push:
+        tags: ["v*"]
+
+concurrency:
+    group: release-${{ github.ref }}
+    cancel-in-progress: false
+
+env:
+    REGISTRY: ghcr.io
+    PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+    ci:
+        uses: ./.github/workflows/ci.yml
+        permissions:
+            contents: read
+
+    image:
+        needs: ci
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            packages: write
+        strategy:
+            fail-fast: true
+            matrix:
+                store: [sqlite, redis, postgres]
+        steps:
+            - uses: actions/checkout@v5
+
+            - name: Version
+              id: version
+              run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+            - uses: docker/setup-buildx-action@v3
+
+            - uses: docker/login-action@v3
+              with:
+                  registry: ${{ env.REGISTRY }}
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Image tags and labels
+              id: meta
+              uses: docker/metadata-action@v5
+              with:
+                  images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/hydra-scheduler
+                  flavor: latest=false
+                  tags: |
+                      type=semver,pattern={{version}},suffix=-${{ matrix.store }}
+                      type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.store }}
+                      type=raw,value=${{ matrix.store }}
+                  labels: |
+                      org.opencontainers.image.title=hydra-scheduler (${{ matrix.store }})
+                      org.opencontainers.image.description=Recurring event scheduler for NATS JetStream, ${{ matrix.store }} store
+
+            - name: Build and push
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  file: cmd/hydra-scheduler/Dockerfile
+                  platforms: ${{ env.PLATFORMS }}
+                  build-args: |
+                      STORE=${{ matrix.store }}
+                      VERSION=${{ steps.version.outputs.version }}
+                  push: true
+                  tags: ${{ steps.meta.outputs.tags }}
+                  labels: ${{ steps.meta.outputs.labels }}
+                  cache-from: type=gha,scope=${{ matrix.store }}
+                  cache-to: type=gha,scope=${{ matrix.store }},mode=max
+
+    binaries:
+        needs: image
+        runs-on: ubuntu-latest
+        strategy:
+            matrix:
+                store: [sqlite, redis, postgres]
+        steps:
+            - uses: actions/checkout@v5
+
+            - name: Version
+              id: version
+              run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+            - uses: docker/setup-buildx-action@v3
+
+            # Same build args as the image job, so its build cache is
+            # reused and this only exports the binaries compiled there.
+            - name: Build binaries
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  file: cmd/hydra-scheduler/Dockerfile
+                  target: binary
+                  platforms: ${{ env.PLATFORMS }}
+                  build-args: |
+                      STORE=${{ matrix.store }}
+                      VERSION=${{ steps.version.outputs.version }}
+                  outputs: type=local,dest=out
+                  cache-from: type=gha,scope=${{ matrix.store }}
+
+            - name: Package
+              run: |
+                  version="${{ steps.version.outputs.version }}"
+                  mkdir dist
+                  for dir in out/linux_*; do
+                    arch="${dir#out/linux_}"
+                    name="hydra-scheduler-${{ matrix.store }}-${version}-linux-${arch}"
+                    mkdir "$name"
+                    cp "$dir/hydra-scheduler-${{ matrix.store }}" "$name/hydra-scheduler"
+                    cp LICENSE README.md "$name/"
+                    tar -czf "dist/$name.tar.gz" "$name"
+                  done
+                  ls -l dist
+
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: binaries-${{ matrix.store }}
+                  path: dist/*.tar.gz
+                  if-no-files-found: error
+
+    release:
+        needs: binaries
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/download-artifact@v4
+              with:
+                  pattern: binaries-*
+                  path: dist
+                  merge-multiple: true
+
+            - name: Checksums
+              working-directory: dist
+              run: sha256sum *.tar.gz | tee SHA256SUMS
+
+            - uses: softprops/action-gh-release@v2
+              with:
+                  files: |
+                      dist/*.tar.gz
+                      dist/SHA256SUMS
+                  generate_release_notes: true
+                  prerelease: ${{ contains(github.ref_name, '-') }}

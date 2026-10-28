@@ -384,3 +384,74 @@ func TestStats(t *testing.T) {
 type assertErr struct{}
 
 func (assertErr) Error() string { return "test error" }
+
+// Minimum workers must survive ScaleDownIdle; otherwise a job
+// submitted after an idle period is never processed.
+func TestJobProcessedAfterIdlePeriod(t *testing.T) {
+	q := New(Config{
+		MinWorkers:    1,
+		MaxWorkers:    2,
+		ScaleDownIdle: 50 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	processed := make(chan struct{}, 1)
+	q.Handle("idle", func(ctx context.Context, job *Job) error {
+		processed <- struct{}{}
+		return nil
+	})
+
+	if err := q.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer q.Stop(ctx)
+
+	time.Sleep(200 * time.Millisecond)
+
+	if err := q.Submit(ctx, "idle", NewJob("", "late", nil, nil)); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-processed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job submitted after the idle period was never processed")
+	}
+}
+
+// A job running longer than LeaseTTL must keep its lease, or
+// the sync loop recovers it as an orphan and runs it twice.
+func TestLongJobKeepsLease(t *testing.T) {
+	q := New(Config{
+		LeaseTTL:     90 * time.Millisecond,
+		SyncInterval: 20 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var runs atomic.Int32
+	done := make(chan struct{})
+	q.Handle("slow", func(ctx context.Context, job *Job) error {
+		if runs.Add(1) == 1 {
+			time.Sleep(400 * time.Millisecond)
+			close(done)
+		}
+		return nil
+	})
+
+	if err := q.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer q.Stop(ctx)
+
+	q.Submit(ctx, "slow", NewJob("", "slow", nil, nil))
+	<-done
+	time.Sleep(100 * time.Millisecond)
+
+	if n := runs.Load(); n != 1 {
+		t.Fatalf("job ran %d times, want 1", n)
+	}
+}

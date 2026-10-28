@@ -17,6 +17,9 @@ const (
 
 	// ScheduleInterval represents a fixed interval schedule.
 	ScheduleInterval ScheduleType = "interval"
+
+	// ScheduleOnce fires a single time, at StartAt.
+	ScheduleOnce ScheduleType = "once"
 )
 
 // ScheduleRule is the public recurrence definition.
@@ -29,6 +32,8 @@ const (
 //
 // Interval schedules use IntervalNanos (or IntervalMs for
 // backward compatibility).
+//
+// Once schedules fire a single time at StartAt.
 type ScheduleRule struct {
 	Type ScheduleType
 
@@ -60,6 +65,14 @@ type ScheduleRule struct {
 	//   America/New_York
 	//   Europe/Madrid
 	Timezone string
+
+	// Offset shifts every occurrence by a fixed duration.
+	//
+	// Negative values fire before the nominal occurrence
+	// (e.g. -5m for a reminder five minutes ahead), positive
+	// values fire after it. StartAt and EndAt bound nominal
+	// occurrences, not shifted ones.
+	Offset time.Duration
 }
 
 func NewCronScheduleRule(cronExpr string) ScheduleRule {
@@ -73,6 +86,13 @@ func NewRRuleScheduleRule(rruleExpr string) ScheduleRule {
 	return ScheduleRule{
 		Type:       ScheduleRRule,
 		Expression: rruleExpr,
+	}
+}
+
+func NewOnceScheduleRule(at time.Time) ScheduleRule {
+	return ScheduleRule{
+		Type:    ScheduleOnce,
+		StartAt: &at,
 	}
 }
 
@@ -95,6 +115,11 @@ func (r ScheduleRule) Validate() error {
 	case ScheduleInterval:
 		if r.IntervalNanos <= 0 && r.IntervalMs <= 0 {
 			return errors.New("interval must be greater than zero")
+		}
+
+	case ScheduleOnce:
+		if r.StartAt == nil {
+			return errors.New("once requires a start time")
 		}
 
 	default:
@@ -123,4 +148,54 @@ func (r ScheduleRule) WithStartAt(t time.Time) ScheduleRule {
 func (r ScheduleRule) WithEndAt(t time.Time) ScheduleRule {
 	r.EndAt = &t
 	return r
+}
+
+func (r ScheduleRule) WithOffset(d time.Duration) ScheduleRule {
+	r.Offset = d
+	return r
+}
+
+// Equal reports whether two rules produce the same
+// occurrences. Times are compared at millisecond precision,
+// the precision stores persist them with.
+func (r ScheduleRule) Equal(o ScheduleRule) bool {
+	return r.Type == o.Type &&
+		r.Expression == o.Expression &&
+		r.interval() == o.interval() &&
+		r.Timezone == o.Timezone &&
+		r.Offset == o.Offset &&
+		sameMillis(r.StartAt, o.StartAt) &&
+		sameMillis(r.EndAt, o.EndAt)
+}
+
+func (r ScheduleRule) interval() time.Duration {
+	if r.IntervalNanos > 0 {
+		return time.Duration(r.IntervalNanos)
+	}
+
+	return time.Duration(r.IntervalMs) * time.Millisecond
+}
+
+func sameMillis(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+
+	return a.UnixMilli() == b.UnixMilli()
+}
+
+// String renders the recurrence for logs and listings: the
+// expression, the interval, or the time of a once rule.
+func (r ScheduleRule) String() string {
+	switch r.Type {
+	case ScheduleInterval:
+		return r.interval().String()
+	case ScheduleOnce:
+		if r.StartAt != nil {
+			return r.StartAt.UTC().Format(time.RFC3339)
+		}
+		return ""
+	default:
+		return r.Expression
+	}
 }
