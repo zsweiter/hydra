@@ -73,6 +73,19 @@ COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /out/hydra-scheduler /hydra-scheduler
 COPY --from=build --chown=65532:65532 /out/data /data
 
+# for the health check.
+COPY --from=ghcr.io/tarampampam/microcheck:1.4.0 /bin/httpcheck /bin/httpcheck
+
+# The ops port is on in the image so the health check has
+# something to probe. /healthz only says the process is alive;
+# /readyz (store, NATS, streams) is for orchestrator readiness.
+# Changing HYDRA_HTTP_ADDR means overriding the health check too.
+ENV HYDRA_HTTP_ADDR=:8080
+
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
+    CMD ["httpcheck", "http://localhost:8080/healthz"]
+
 WORKDIR /data
 
 USER 65532:65532
